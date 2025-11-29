@@ -9,6 +9,7 @@ WORKDIR /app
 # 复制依赖文件并安装依赖
 # 这一步单独做可以利用Docker的层缓存机制，如果requirements.txt不变，则不会重新安装
 COPY requirements.txt .
+RUN pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python download_model.py
