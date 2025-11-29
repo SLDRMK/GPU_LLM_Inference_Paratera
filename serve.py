@@ -1,5 +1,4 @@
 import torch
-import torch_musa
 from fastapi import FastAPI
 from pydantic import BaseModel
 import os
@@ -25,7 +24,7 @@ generator = pipeline(
     'text-generation',
     model=model,
     tokenizer=tokenizer,
-    device='musa'
+    device='cuda'
 )
 set_seed(42)
 
