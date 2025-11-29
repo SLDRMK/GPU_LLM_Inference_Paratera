@@ -1,0 +1,22 @@
+# 使用一个轻量的Python基础镜像
+
+# for GPU
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制依赖文件并安装依赖
+# 这一步单独做可以利用Docker的层缓存机制，如果requirements.txt不变，则不会重新安装
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制项目中的所有其他文件
+COPY . .
+
+# 声明容器对外暴露的端口
+EXPOSE 8000
+
+# 容器启动时运行的命令
+# 使用uvicorn启动FastAPI服务，并监听所有网络接口的8000端口
+CMD ["uvicorn", "serve:app", "--host", "0.0.0.0", "--port", "8000"]
