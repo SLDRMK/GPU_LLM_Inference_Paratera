@@ -5,10 +5,7 @@ import os
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 from transformers import pipeline, set_seed
 from transformers import AutoModelForCausalLM, AutoTokenizer
-# --- 模型加载 ---
-# 为了保证最小化和快速启动，我们使用 distilgpt2
-# 这是GPT-2的一个更小、更快、更轻的版本
-# 在生产或更复杂的场景中，可以替换为其他模型
+import socket
 
 def check_internet(host="8.8.8.8", port=53, timeout=3):
     try:
