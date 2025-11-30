@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY download_model.py . 
 RUN python download_model.py
 
 # 复制项目中的所有其他文件
