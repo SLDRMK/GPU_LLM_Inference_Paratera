@@ -10,9 +10,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # 这是GPT-2的一个更小、更快、更轻的版本
 # 在生产或更复杂的场景中，可以替换为其他模型
 
+def check_internet(host="8.8.8.8", port=53, timeout=3):
+    try:
+        socket.setdefaulttimeout(timeout)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
+        return True
+    except Exception:
+        return False
 
 # 本地模型路径
 LOCAL_MODEL_PATH = "./local-model"
+
+# --- 网络连通性测试 ---
+internet_ok = check_internet()
+print("【Internet Connectivity Test】:",
+      "CONNECTED" if internet_ok else "OFFLINE / BLOCKED")
 
 # --- 模型加载（从本地加载，无需网络）---
 print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
