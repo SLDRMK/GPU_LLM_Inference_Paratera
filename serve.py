@@ -59,6 +59,8 @@ def predict(request: PromptRequest):
     接收一个prompt，使用加载的模型进行推理，并返回结果。
     """
 
+    raise RuntimeError(request.prompt)
+
     # 单轮 Prompt
     prompt = f"Q: {request.prompt}\nA:"
 
