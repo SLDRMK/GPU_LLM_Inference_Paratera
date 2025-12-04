@@ -6,8 +6,8 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 模型名称
-model_name = "facebook/opt-1.3b"
-# 本地保存路径（可自定义，例如 "./local-distilgpt2"）
+model_name = "Qwen/Qwen2.5-0.5B"
+
 local_model_path = "./local-model"
 
 # 下载并保存模型和tokenizer
