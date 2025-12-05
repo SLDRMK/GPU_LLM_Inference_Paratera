@@ -16,7 +16,7 @@
 
 您需要关注的核心文件是 `serve.py`。
 
-目前，它使用 `transformers` 库加载了模型 `Qwen/Qwen2.5-0.5B`。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的/predict等端点即可。
+目前，它使用 `transformers` 库加载了模型 `Qwen/Qwen2.5-0.5B`。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的'/predict'和'/'等端点即可。
 
 
 **重要**: 评测系统会向 `/predict` 端点发送 `POST` 请求，其JSON body格式为：
