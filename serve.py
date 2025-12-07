@@ -67,7 +67,7 @@ def predict(request: PromptRequest):
     # 使用 max_new_tokens + return_full_text=False 来防止重复 prompt
     model_output = generator(
         prompt,
-        max_new_tokens=400,            # 生成长度只限制新增内容
+        max_new_tokens=200,            # 生成长度只限制新增内容
         num_return_sequences=1,
         do_sample=False,              # 关闭采样，稳定输出
         return_full_text=False,       # 只返回新增内容，非常关键！
