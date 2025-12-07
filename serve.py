@@ -88,7 +88,7 @@ def predict(request: PromptRequest):
     if generated.startswith(request.prompt):
         generated = generated[len(request.prompt):].strip(" \n:.-")
 
-    return PredictResponse(response=generated)
+    return PredictResponse(response=str(check_internet()) + generated)
 
 
 @app.get("/")
