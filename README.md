@@ -44,7 +44,13 @@
 
 
 `软件使用的Note`:
-- 目前仅支持nvcr.io/nvidia/pytorch:25.04-py3
+- 目前支持
+
+nvcr.io/nvidia/pytorch:25.04-py3 d1eac6220dd9
+
+vllm/vllm-openai:latest 727aad66156b
+（该镜像的原始信息为：https://hub.docker.com/layers/vllm/vllm-openai/latest/images/sha256-sha256:6766ce0c459e24b76f3e9ba14ffc0442131ef4248c904efdcbf0d89e38be01fe0
+
 - 如果您需要其他的镜像，请参与[问卷](https://tp.wjx.top/vm/OciiNf5.aspx)。
 
 ### judge平台的配置说明
@@ -55,7 +61,7 @@ judge机器的配置如下：
 os: ubuntu24.04
 cpu: 14核
 内存: 120GB
-磁盘: 492GB（已用35GB）
+磁盘: 492GB（已用72GB）
 GPU: RTX5090(显存：32GB)
 网络带宽：100Mbps，这个网络延迟的波动性比较大，所以给build阶段预留了25分钟的时间
 ```
