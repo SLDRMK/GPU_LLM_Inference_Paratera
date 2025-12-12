@@ -72,6 +72,6 @@ judge系统的配置如下：
 
 ``` text
 docker build stage: 1500s
-docker run - health check stage: 180s
+docker run - health check stage: 420s
 docker run - predict stage: 360s
 ```
