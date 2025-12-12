@@ -51,6 +51,8 @@ nvcr.io/nvidia/pytorch:25.04-py3 d1eac6220dd9
 vllm/vllm-openai:latest 727aad66156b
 （该镜像的原始信息为：https://hub.docker.com/layers/vllm/vllm-openai/latest/images/sha256-sha256:6766ce0c459e24b76f3e9ba14ffc0442131ef4248c904efdcbf0d89e38be01fe0
 
+swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.11.0 d8d39b59e909
+
 - 如果您需要其他的镜像，请参与[问卷](https://tp.wjx.top/vm/OciiNf5.aspx)。
 
 ### judge平台的配置说明
