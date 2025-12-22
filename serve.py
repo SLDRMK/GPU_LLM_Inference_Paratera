@@ -1,13 +1,19 @@
+import os
+import socket
+
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
-import os
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-from transformers import pipeline, set_seed
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import socket
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
 
-def check_internet(host="8.8.8.8", port=53, timeout=3):
+# 与训练脚本保持一致：强制离线模式，避免任何联网请求
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
+
+def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> bool:
+    """仅用于日志的网络连通性测试，不作为逻辑依赖。"""
     try:
         socket.setdefaulttimeout(timeout)
         socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
@@ -15,63 +21,83 @@ def check_internet(host="8.8.8.8", port=53, timeout=3):
     except Exception:
         return False
 
-# 本地模型路径
-LOCAL_MODEL_PATH = "./local-model"
 
-# --- 网络连通性测试 ---
+# 本地合并后的 Qwen3-4B 模型目录
+# 评测时容器内先运行 download_model.py，会在当前工作目录生成 ./Qwen3-4B
+LOCAL_MODEL_PATH = "./Qwen3-4B"
+
+# --- 网络连通性测试，仅打印结果 ---
 internet_ok = check_internet()
-print("【Internet Connectivity Test】:",
-      "CONNECTED" if internet_ok else "OFFLINE / BLOCKED")
+print(
+    "【Internet Connectivity Test】: ",
+    "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
+)
 
-# --- 模型加载（从本地加载，无需网络）---
+# --- 模型加载（完全本地，无网络）---
 print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
-# 手动加载本地模型和tokenizer
-tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH)
-model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_PATH)
-# 初始化pipeline（使用本地模型）
+
+# 加载 tokenizer（仅使用本地文件）
+tokenizer = AutoTokenizer.from_pretrained(
+    LOCAL_MODEL_PATH,
+    local_files_only=True,
+)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# 加载模型到 GPU
+model = AutoModelForCausalLM.from_pretrained(
+    LOCAL_MODEL_PATH,
+    local_files_only=True,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    device_map=None,
+)
+try:
+    model.to("cuda:0")
+except Exception:
+    # 若 GPU 不可用，则退回 CPU（评测环境应具备 GPU）
+    model.to("cpu")
+
+# 初始化 pipeline（使用本地模型）
 generator = pipeline(
-    'text-generation',
+    "text-generation",
     model=model,
     tokenizer=tokenizer,
-    device='cuda'
+    device=0 if torch.cuda.is_available() else -1,
 )
 set_seed(42)
 
+
 # --- API 定义 ---
-# 创建FastAPI应用实例
 app = FastAPI(
     title="Simple Inference Server",
-    description="A simple API to run a small language model."
+    description="A simple API to run a medical Qwen3-4B model.",
 )
 
-# 定义API请求的数据模型
+
 class PromptRequest(BaseModel):
     prompt: str
 
-# 定义API响应的数据模型
+
 class PredictResponse(BaseModel):
     response: str
-    
-# --- API 端点 ---
+
+
 @app.post("/predict", response_model=PredictResponse)
-def predict(request: PromptRequest):
+def predict(request: PromptRequest) -> PredictResponse:
     """
-    接收一个prompt，使用加载的模型进行推理，并返回结果。
+    接收一个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
     """
-
-    # raise RuntimeError(request.prompt)
-
-    # 单轮 Prompt
+    # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
     prompt = f"Q: {request.prompt}\nA:"
 
     # 使用 max_new_tokens + return_full_text=False 来防止重复 prompt
     model_output = generator(
         prompt,
-        max_new_tokens=200,            # 生成长度只限制新增内容
+        max_new_tokens=200,  # 生成长度只限制新增内容
         num_return_sequences=1,
-        do_sample=False,              # 关闭采样，稳定输出
-        return_full_text=False,       # 只返回新增内容，非常关键！
-        pad_token_id=tokenizer.eos_token_id,
+        do_sample=False,  # 关闭采样，稳定输出
+        return_full_text=False,  # 只返回新增内容
+        pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
 
