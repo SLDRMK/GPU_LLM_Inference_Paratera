@@ -75,3 +75,102 @@ docker build stage: 1500s
 docker run - health check stage: 420s
 docker run - predict stage: 360s
 ```
+
+## 本地环境搭建与运行（参考）
+
+### 1) 安装 Docker（Ubuntu 22.04/24.04）
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+```
+
+> 说明：如果不想每次都 `sudo docker ...`，可将当前用户加入 `docker` 组后重新登录：
+>
+> ```bash
+> sudo usermod -aG docker "$USER"
+> ```
+
+### 2) 让容器支持 NVIDIA GPU（安装 NVIDIA Container Toolkit）
+
+若运行容器时出现 “NVIDIA Driver was not detected / GPU functionality will not be available”，通常是未安装或未配置 NVIDIA Container Toolkit。
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+验证 GPU 是否可被容器使用：
+
+```bash
+sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+### 3) 构建镜像
+
+在项目根目录执行：
+
+```bash
+docker build -t paratera-demo:latest .
+```
+
+### 4) 启动容器（CPU / GPU）
+
+- CPU 运行：
+
+```bash
+docker run --rm -p 8000:8000 paratera-demo:latest
+```
+
+- GPU 运行（推荐参数）：
+
+```bash
+docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 paratera-demo:latest
+```
+
+### 5) 接口验证（符合评测契约）
+
+健康检查：
+
+```bash
+curl -s http://127.0.0.1:8000/ ; echo
+```
+
+评测契约：`POST /predict` + `{"prompt":"..."}`，返回 `{"response":"..."}`：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"你好，简单自我介绍一下"}' ; echo
+```
+
+### 6) 模型文件位置
+
+本模板在镜像构建阶段执行 `python download_model.py`，默认将模型下载到容器内工作目录下：
+
+- 容器内路径：`/app/Qwen3-4B`
+
+如需从镜像导出到宿主机：
+
+```bash
+cid=$(docker create paratera-demo:latest)
+docker cp "$cid":/app/Qwen3-4B ./Qwen3-4B
+docker rm "$cid"
+```

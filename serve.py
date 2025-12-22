@@ -113,7 +113,7 @@ class PredictResponse(BaseModel):
     responses: Optional[List[str]] = None
 
 
-@app.post("/predict", response_model=PredictResponse)
+@app.post("/predict", response_model=PredictResponse, response_model_exclude_none=True)
 def predict(request: PromptRequest) -> PredictResponse:
     """
     接收一个或多个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
@@ -193,7 +193,7 @@ def predict(request: PromptRequest) -> PredictResponse:
     return PredictResponse(response=generated)
 
 
-@app.get("/")
+@app.get("/", response_model_exclude_none=True)
 def health_check():
     """
     健康检查端点：
