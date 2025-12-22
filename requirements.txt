@@ -1,5 +1,7 @@
 fastapi>=0.104.0
 uvicorn>=0.24.0
 pydantic>=2.4.0
-transformers==4.37.2
+transformers>=4.46.0
+tokenizers>=0.20.0
 modelscope>=1.18.0
+tiktoken>=0.7.0

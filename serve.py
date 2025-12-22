@@ -38,10 +38,24 @@ print(
 print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
 
 # 加载 tokenizer（仅使用本地文件）
-tokenizer = AutoTokenizer.from_pretrained(
-    LOCAL_MODEL_PATH,
-    local_files_only=True,
-)
+# Qwen 系列在不同 transformers/tokenizers 版本组合下，fast tokenizer 可能因为 tokenizer.json 格式差异而解析失败。
+# 这里做一个稳健回退：先尝试 use_fast=True，失败则回退 use_fast=False（需要 tiktoken）。
+tokenizer = None
+try:
+    tokenizer = AutoTokenizer.from_pretrained(
+        LOCAL_MODEL_PATH,
+        local_files_only=True,
+        use_fast=True,
+        trust_remote_code=True,
+    )
+except Exception as e:
+    print(f"Fast tokenizer 加载失败，将回退到 slow tokenizer。原因：{type(e).__name__}: {e}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        LOCAL_MODEL_PATH,
+        local_files_only=True,
+        use_fast=False,
+        trust_remote_code=True,
+    )
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -49,6 +63,7 @@ if tokenizer.pad_token is None:
 model = AutoModelForCausalLM.from_pretrained(
     LOCAL_MODEL_PATH,
     local_files_only=True,
+    trust_remote_code=True,
     torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
     device_map=None,
 )
