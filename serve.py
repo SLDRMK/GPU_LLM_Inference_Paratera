@@ -5,6 +5,7 @@ import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
+from typing import List, Optional
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -75,18 +76,78 @@ app = FastAPI(
 
 
 class PromptRequest(BaseModel):
-    prompt: str
+    """
+    兼容单条和批量两种调用方式：
+    - 单条：传入 prompt 字段
+    - 批量：传入 prompts 字段（评测时一次性推送全部问题）
+    """
+
+    prompt: Optional[str] = None
+    prompts: Optional[List[str]] = None
+    batch_size: Optional[int] = 384  # 仅批量时使用，默认 384
 
 
 class PredictResponse(BaseModel):
-    response: str
+    """
+    兼容单条和批量两种返回格式：
+    - 单条：response
+    - 批量：responses
+    """
+
+    response: Optional[str] = None
+    responses: Optional[List[str]] = None
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PromptRequest) -> PredictResponse:
     """
-    接收一个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
+    接收一个或多个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
+
+    说明：
+    - 普通模式：/ 返回 {"status": "ok"} 时，评测按单条调用，只使用 prompt 字段。
+    - batch 模式：/ 返回 {"status": "batch"} 时，评测会一次性将所有问题通过 prompts 字段发到这里。
     """
+    # ---------- 批量模式：prompts 字段存在 ----------
+    if request.prompts:
+        prompts = [f"Q: {q}\nA:" for q in request.prompts]
+        batch_size = request.batch_size or 384
+
+        model_outputs = generator(
+            prompts,
+            max_new_tokens=200,
+            num_return_sequences=1,
+            do_sample=False,
+            return_full_text=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            batch_size=batch_size,
+        )
+
+        responses: List[str] = []
+        # 对于 text-generation，多输入时返回 List[List[Dict]]
+        for raw_question, outputs in zip(request.prompts, model_outputs):
+            generated = outputs[0]["generated_text"].strip()
+
+            # 截断可能继续生成的 "Q:" 或下一轮问话
+            for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
+                pos = generated.find(sep)
+                if pos != -1:
+                    generated = generated[:pos].strip()
+                    break
+
+            # 防止答案开头重复问句
+            if generated.startswith(raw_question):
+                generated = generated[len(raw_question) :].strip(" \n:.-")
+
+            responses.append(generated)
+
+        return PredictResponse(responses=responses)
+
+    # ---------- 单条模式：fallback 到 prompt ----------
+    if not request.prompt:
+        # 既没有 prompt 也没有 prompts，返回空响应以避免 500
+        return PredictResponse(response="")
+
     # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
     prompt = f"Q: {request.prompt}\nA:"
 
@@ -120,6 +181,8 @@ def predict(request: PromptRequest) -> PredictResponse:
 @app.get("/")
 def health_check():
     """
-    健康检查端点，用于确认服务是否启动成功。
+    健康检查端点：
+    - 返回 {\"status\": \"batch\"} 时，评测系统会采用 batch 模式：
+      一次性将全部评测问题通过 /predict 的 prompts 字段发送过来。
     """
-    return {"status": "ok"}
+    return {"status": "batch"}
