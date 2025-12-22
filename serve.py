@@ -4,7 +4,7 @@ import socket
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, set_seed
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline, set_seed
 from typing import List, Optional
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
@@ -23,9 +23,12 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
         return False
 
 
-# 本地合并后的 Qwen3-4B 模型目录
+# 本地模型目录
 # 评测时容器内先运行 download_model.py，会在当前工作目录生成 ./Qwen3-4B
-LOCAL_MODEL_PATH = "./Qwen3-4B"
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "./Qwen3-4B")
+
+# 若目录下存在 quantize_meta.json，默认按 bitsandbytes 4bit 方式加载（可用 USE_4BIT=0 强制关闭）
+USE_4BIT = os.getenv("USE_4BIT", "auto").lower()  # auto/1/0
 
 # --- 网络连通性测试，仅打印结果 ---
 internet_ok = check_internet()
@@ -59,27 +62,90 @@ except Exception as e:
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# 加载模型到 GPU
-model = AutoModelForCausalLM.from_pretrained(
-    LOCAL_MODEL_PATH,
-    local_files_only=True,
-    trust_remote_code=True,
-    torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-    device_map=None,
-)
-try:
-    model.to("cuda:0")
-except Exception:
-    # 若 GPU 不可用，则退回 CPU（评测环境应具备 GPU）
-    model.to("cpu")
+# ---------- 可选：bitsandbytes 4bit 量化加载 ----------
+def _should_use_4bit() -> bool:
+    if USE_4BIT in ("0", "false", "no", "off"):
+        return False
+    if USE_4BIT in ("1", "true", "yes", "on"):
+        return True
+    # auto
+    return os.path.exists(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"))
+
+
+if _should_use_4bit():
+    # 从 quantize_meta.json 读取 compute_dtype（缺省用 float16）
+    compute_dtype = torch.float16
+    try:
+        import json
+
+        with open(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"), "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if str(meta.get("compute_dtype", "")).lower() in ("bfloat16", "bf16"):
+            compute_dtype = torch.bfloat16
+        elif str(meta.get("compute_dtype", "")).lower() in ("float16", "fp16"):
+            compute_dtype = torch.float16
+        print(f"检测到 4bit 量化模型，启用 bitsandbytes 4bit 加载（compute_dtype={compute_dtype}）。")
+    except Exception as e:
+        print(f"读取 quantize_meta.json 失败，将使用默认 compute_dtype=float16。原因：{type(e).__name__}: {e}")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+
+    # 关键：你这个仓库的权重已经是“预量化”（Linear 权重 dtype=U8，并且带 quant_state/absmax 等张量）。
+    # 如果走 transformers 的“量化 on-the-fly”路径，会把 U8 当成待量化输入，从而触发：
+    #   RuntimeError: Blockwise 4bit quantization only supports 16/32-bit floats, but got torch.uint8
+    #
+    # 规避方式：把量化配置写进 config，让 transformers 以“已量化 checkpoint”的方式装配 bnb 模块，
+    # 然后直接加载权重（不再对 U8 权重做二次 quantize）。
+    cfg = AutoConfig.from_pretrained(
+        LOCAL_MODEL_PATH,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    # 某些版本 transformers 期望 config.quantization_config 是 dict；某些版本也接受 BitsAndBytesConfig。
+    try:
+        cfg.quantization_config = bnb_config.to_dict()  # type: ignore[attr-defined]
+    except Exception:
+        cfg.quantization_config = bnb_config  # type: ignore[attr-defined]
+
+    model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL_PATH,
+        local_files_only=True,
+        trust_remote_code=True,
+        config=cfg,
+        device_map="auto",
+        torch_dtype=compute_dtype,
+    )
+else:
+    # 非量化：全精度/半精度加载后再 .to(cuda)
+    model = AutoModelForCausalLM.from_pretrained(
+        LOCAL_MODEL_PATH,
+        local_files_only=True,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        device_map=None,
+    )
+    try:
+        model.to("cuda:0")
+    except Exception:
+        # 若 GPU 不可用，则退回 CPU（评测环境应具备 GPU）
+        model.to("cpu")
 
 # 初始化 pipeline（使用本地模型）
-generator = pipeline(
-    "text-generation",
-    model=model,
-    tokenizer=tokenizer,
-    device=0 if torch.cuda.is_available() else -1,
-)
+pipeline_kwargs = {
+    "task": "text-generation",
+    "model": model,
+    "tokenizer": tokenizer,
+}
+# 若模型是通过 device_map="auto" 加载（accelerate 管理设备），pipeline 不能再传 device 参数
+if not hasattr(model, "hf_device_map"):
+    pipeline_kwargs["device"] = 0 if torch.cuda.is_available() else -1
+
+generator = pipeline(**pipeline_kwargs)
 set_seed(42)
 
 

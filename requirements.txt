@@ -5,3 +5,5 @@ transformers==4.57.3
 tokenizers==0.22.1
 modelscope>=1.18.0
 tiktoken>=0.7.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.3
