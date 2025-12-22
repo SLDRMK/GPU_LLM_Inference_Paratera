@@ -1,7 +1,7 @@
-fastapi>=0.104.0
+fastapi==0.127.0
 uvicorn>=0.24.0
-pydantic>=2.4.0
-transformers>=4.46.0
-tokenizers>=0.20.0
+pydantic==2.11.2
+transformers==4.57.3
+tokenizers==0.22.1
 modelscope>=1.18.0
 tiktoken>=0.7.0
