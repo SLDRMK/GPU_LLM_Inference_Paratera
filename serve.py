@@ -1,7 +1,7 @@
 import os
 import socket
-from threading import Lock
-from typing import List, Optional, Union
+from threading import Lock, Thread
+from typing import List, Union
 
 import torch
 from fastapi import FastAPI
@@ -176,6 +176,27 @@ app = FastAPI(
 )
 
 
+@app.on_event("startup")
+def _startup_warmup():
+    """
+    评测平台通常先做健康检查（GET /），再进入 predict 阶段。
+    为了避免 predict 阶段首个请求才开始加载模型导致超时，这里在启动后后台预热加载（不阻塞服务启动）。
+    """
+    disable = os.getenv("DISABLE_WARMUP", "0").lower() in ("1", "true", "yes", "on")
+    if disable:
+        return
+
+    def _bg():
+        try:
+            ensure_model_loaded()
+            print("Warmup: model loaded.")
+        except Exception as e:
+            # 不要让预热失败影响服务启动；真正推理时仍会触发 ensure_model_loaded 并抛出更明确错误
+            print(f"Warmup failed (will retry on first /predict): {type(e).__name__}: {e}")
+
+    Thread(target=_bg, daemon=True).start()
+
+
 class PromptRequest(BaseModel):
     prompt: Union[str, List[str]]
 
@@ -184,7 +205,7 @@ class PredictResponse(BaseModel):
     response: Union[str, List[str]]
 
 
-@app.post("/predict", response_model=PredictResponse, response_model_exclude_none=True)
+@app.post("/predict", response_model=PredictResponse)
 def predict(request: PromptRequest) -> PredictResponse:
     """
     接收一个或多个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
@@ -264,7 +285,7 @@ def predict(request: PromptRequest) -> PredictResponse:
     return PredictResponse(response=generated)
 
 
-@app.get("/", response_model_exclude_none=True)
+@app.get("/")
 def health_check():
     """
     健康检查端点：
