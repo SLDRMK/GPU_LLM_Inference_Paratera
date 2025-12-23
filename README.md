@@ -128,7 +128,29 @@ sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 在项目根目录执行：
 
 ```bash
-docker build -t paratera-demo:latest .
+sudo docker build -t paratera-demo:latest .
+```
+
+**重新构建镜像**（当代码或依赖有更新时）：
+
+如果需要完全重新构建（不使用缓存），可以执行：
+
+```bash
+# 停止并删除正在运行的容器（如果有）
+sudo docker ps -a | grep paratera-demo | awk '{print $1}' | xargs -r sudo docker stop
+sudo docker ps -a | grep paratera-demo | awk '{print $1}' | xargs -r sudo docker rm
+
+# 删除旧镜像（可选）
+sudo docker rmi paratera-demo:latest
+
+# 重新构建镜像（不使用缓存）
+sudo docker build --no-cache -t paratera-demo:latest .
+```
+
+或者简单方式（仅重新构建，保留旧镜像）：
+
+```bash
+sudo docker build -t paratera-demo:latest .
 ```
 
 ### 4) 启动容器（CPU / GPU）
@@ -136,13 +158,13 @@ docker build -t paratera-demo:latest .
 - CPU 运行：
 
 ```bash
-docker run --rm -p 8000:8000 paratera-demo:latest
+sudo docker run --rm -p 8000:8000 paratera-demo:latest
 ```
 
 - GPU 运行（推荐参数）：
 
 ```bash
-docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 paratera-demo:latest
+sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 paratera-demo:latest
 ```
 
 ### 5) 接口验证（符合评测契约）
