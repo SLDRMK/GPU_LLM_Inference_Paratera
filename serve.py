@@ -1,11 +1,19 @@
 import os
 import socket
+from threading import Lock
+from typing import List, Optional, Union
 
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline, set_seed
-from typing import List, Optional
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    pipeline,
+    set_seed,
+)
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -30,39 +38,15 @@ LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "./Qwen3-4B")
 # 若目录下存在 quantize_meta.json，默认按 bitsandbytes 4bit 方式加载（可用 USE_4BIT=0 强制关闭）
 USE_4BIT = os.getenv("USE_4BIT", "auto").lower()  # auto/1/0
 
-# --- 网络连通性测试，仅打印结果 ---
-internet_ok = check_internet()
-print(
-    "【Internet Connectivity Test】: ",
-    "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
-)
+# 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 
-# --- 模型加载（完全本地，无网络）---
-print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
+_load_lock = Lock()
+_tokenizer = None
+_model = None
+_generator = None
 
-# 加载 tokenizer（仅使用本地文件）
-# Qwen 系列在不同 transformers/tokenizers 版本组合下，fast tokenizer 可能因为 tokenizer.json 格式差异而解析失败。
-# 这里做一个稳健回退：先尝试 use_fast=True，失败则回退 use_fast=False（需要 tiktoken）。
-tokenizer = None
-try:
-    tokenizer = AutoTokenizer.from_pretrained(
-        LOCAL_MODEL_PATH,
-        local_files_only=True,
-        use_fast=True,
-        trust_remote_code=True,
-    )
-except Exception as e:
-    print(f"Fast tokenizer 加载失败，将回退到 slow tokenizer。原因：{type(e).__name__}: {e}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        LOCAL_MODEL_PATH,
-        local_files_only=True,
-        use_fast=False,
-        trust_remote_code=True,
-    )
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
 
-# ---------- 可选：bitsandbytes 4bit 量化加载 ----------
 def _should_use_4bit() -> bool:
     if USE_4BIT in ("0", "false", "no", "off"):
         return False
@@ -72,81 +56,117 @@ def _should_use_4bit() -> bool:
     return os.path.exists(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"))
 
 
-if _should_use_4bit():
-    # 从 quantize_meta.json 读取 compute_dtype（缺省用 float16）
-    compute_dtype = torch.float16
-    try:
-        import json
+def ensure_model_loaded() -> None:
+    """
+    延迟加载模型，避免容器启动（健康检查阶段）因为加载权重过慢/失败而直接判 Runtime Failed。
+    """
+    global _tokenizer, _model, _generator
+    if _generator is not None:
+        return
 
-        with open(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"), "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if str(meta.get("compute_dtype", "")).lower() in ("bfloat16", "bf16"):
-            compute_dtype = torch.bfloat16
-        elif str(meta.get("compute_dtype", "")).lower() in ("float16", "fp16"):
+    with _load_lock:
+        if _generator is not None:
+            return
+
+        # --- 网络连通性测试，仅打印结果 ---
+        internet_ok = check_internet()
+        print(
+            "【Internet Connectivity Test】: ",
+            "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
+        )
+
+        # --- 模型加载（完全本地，无网络）---
+        print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
+
+        # 加载 tokenizer（仅使用本地文件）
+        # Qwen 系列在不同 transformers/tokenizers 版本组合下，fast tokenizer 可能因为 tokenizer.json 格式差异而解析失败。
+        # 这里做一个稳健回退：先尝试 use_fast=True，失败则回退 use_fast=False（需要 tiktoken）。
+        try:
+            _tokenizer = AutoTokenizer.from_pretrained(
+                LOCAL_MODEL_PATH,
+                local_files_only=True,
+                use_fast=True,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            print(f"Fast tokenizer 加载失败，将回退到 slow tokenizer。原因：{type(e).__name__}: {e}")
+            _tokenizer = AutoTokenizer.from_pretrained(
+                LOCAL_MODEL_PATH,
+                local_files_only=True,
+                use_fast=False,
+                trust_remote_code=True,
+            )
+        if _tokenizer.pad_token is None:
+            _tokenizer.pad_token = _tokenizer.eos_token
+
+        if _should_use_4bit():
+            # 从 quantize_meta.json 读取 compute_dtype（缺省用 float16）
             compute_dtype = torch.float16
-        print(f"检测到 4bit 量化模型，启用 bitsandbytes 4bit 加载（compute_dtype={compute_dtype}）。")
-    except Exception as e:
-        print(f"读取 quantize_meta.json 失败，将使用默认 compute_dtype=float16。原因：{type(e).__name__}: {e}")
+            try:
+                import json
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=compute_dtype,
-    )
+                with open(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"), "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                if str(meta.get("compute_dtype", "")).lower() in ("bfloat16", "bf16"):
+                    compute_dtype = torch.bfloat16
+                elif str(meta.get("compute_dtype", "")).lower() in ("float16", "fp16"):
+                    compute_dtype = torch.float16
+                print(f"检测到 4bit 量化模型，启用 bitsandbytes 4bit 加载（compute_dtype={compute_dtype}）。")
+            except Exception as e:
+                print(f"读取 quantize_meta.json 失败，将使用默认 compute_dtype=float16。原因：{type(e).__name__}: {e}")
 
-    # 关键：你这个仓库的权重已经是“预量化”（Linear 权重 dtype=U8，并且带 quant_state/absmax 等张量）。
-    # 如果走 transformers 的“量化 on-the-fly”路径，会把 U8 当成待量化输入，从而触发：
-    #   RuntimeError: Blockwise 4bit quantization only supports 16/32-bit floats, but got torch.uint8
-    #
-    # 规避方式：把量化配置写进 config，让 transformers 以“已量化 checkpoint”的方式装配 bnb 模块，
-    # 然后直接加载权重（不再对 U8 权重做二次 quantize）。
-    cfg = AutoConfig.from_pretrained(
-        LOCAL_MODEL_PATH,
-        local_files_only=True,
-        trust_remote_code=True,
-    )
-    # 某些版本 transformers 期望 config.quantization_config 是 dict；某些版本也接受 BitsAndBytesConfig。
-    try:
-        cfg.quantization_config = bnb_config.to_dict()  # type: ignore[attr-defined]
-    except Exception:
-        cfg.quantization_config = bnb_config  # type: ignore[attr-defined]
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+            )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        LOCAL_MODEL_PATH,
-        local_files_only=True,
-        trust_remote_code=True,
-        config=cfg,
-        device_map="auto",
-        torch_dtype=compute_dtype,
-    )
-else:
-    # 非量化：全精度/半精度加载后再 .to(cuda)
-    model = AutoModelForCausalLM.from_pretrained(
-        LOCAL_MODEL_PATH,
-        local_files_only=True,
-        trust_remote_code=True,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-        device_map=None,
-    )
-    try:
-        model.to("cuda:0")
-    except Exception:
-        # 若 GPU 不可用，则退回 CPU（评测环境应具备 GPU）
-        model.to("cpu")
+            # 关键：权重已是“预量化”（Linear 权重 dtype=U8，并带 quant_state/absmax 等张量）。
+            # 若走 “量化 on-the-fly”，会把 U8 当成待量化输入触发报错。
+            # 规避：把量化配置写进 config，让 transformers 以“已量化 checkpoint”方式装配 bnb 模块并直接加载权重。
+            cfg = AutoConfig.from_pretrained(
+                LOCAL_MODEL_PATH,
+                local_files_only=True,
+                trust_remote_code=True,
+            )
+            try:
+                cfg.quantization_config = bnb_config.to_dict()  # type: ignore[attr-defined]
+            except Exception:
+                cfg.quantization_config = bnb_config  # type: ignore[attr-defined]
 
-# 初始化 pipeline（使用本地模型）
-pipeline_kwargs = {
-    "task": "text-generation",
-    "model": model,
-    "tokenizer": tokenizer,
-}
-# 若模型是通过 device_map="auto" 加载（accelerate 管理设备），pipeline 不能再传 device 参数
-if not hasattr(model, "hf_device_map"):
-    pipeline_kwargs["device"] = 0 if torch.cuda.is_available() else -1
+            _model = AutoModelForCausalLM.from_pretrained(
+                LOCAL_MODEL_PATH,
+                local_files_only=True,
+                trust_remote_code=True,
+                config=cfg,
+                device_map="auto",
+                torch_dtype=compute_dtype,
+            )
+        else:
+            _model = AutoModelForCausalLM.from_pretrained(
+                LOCAL_MODEL_PATH,
+                local_files_only=True,
+                trust_remote_code=True,
+                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                device_map=None,
+            )
+            try:
+                _model.to("cuda:0")
+            except Exception:
+                _model.to("cpu")
 
-generator = pipeline(**pipeline_kwargs)
-set_seed(42)
+        pipeline_kwargs = {
+            "task": "text-generation",
+            "model": _model,
+            "tokenizer": _tokenizer,
+        }
+        # 若模型是通过 device_map="auto" 加载（accelerate 管理设备），pipeline 不能再传 device 参数
+        if not hasattr(_model, "hf_device_map"):
+            pipeline_kwargs["device"] = 0 if torch.cuda.is_available() else -1
+
+        _generator = pipeline(**pipeline_kwargs)
+        set_seed(42)
 
 
 # --- API 定义 ---
@@ -157,26 +177,11 @@ app = FastAPI(
 
 
 class PromptRequest(BaseModel):
-    """
-    兼容单条和批量两种调用方式：
-    - 单条：传入 prompt 字段
-    - 批量：传入 prompts 字段（评测时一次性推送全部问题）
-    """
-
-    prompt: Optional[str] = None
-    prompts: Optional[List[str]] = None
-    batch_size: Optional[int] = 384  # 仅批量时使用，默认 384
+    prompt: Union[str, List[str]]
 
 
 class PredictResponse(BaseModel):
-    """
-    兼容单条和批量两种返回格式：
-    - 单条：response
-    - 批量：responses
-    """
-
-    response: Optional[str] = None
-    responses: Optional[List[str]] = None
+    response: Union[str, List[str]]
 
 
 @app.post("/predict", response_model=PredictResponse, response_model_exclude_none=True)
@@ -188,59 +193,59 @@ def predict(request: PromptRequest) -> PredictResponse:
     - 普通模式：/ 返回 {"status": "ok"} 时，评测按单条调用，只使用 prompt 字段。
     - batch 模式：/ 返回 {"status": "batch"} 时，评测会一次性将所有问题通过 prompts 字段发到这里。
     """
-    # ---------- 批量模式：prompts 字段存在 ----------
-    if request.prompts:
-        prompts = [f"Q: {q}\nA:" for q in request.prompts]
-        batch_size = request.batch_size or 384
+    ensure_model_loaded()
 
-        model_outputs = generator(
-            prompts,
-            max_new_tokens=200,
-            num_return_sequences=1,
-            do_sample=False,
-            return_full_text=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            batch_size=batch_size,
-        )
-
+    # ---------- batch 模式：prompt 为 List[str] ----------
+    if isinstance(request.prompt, list):
+        batch_questions = request.prompt
         responses: List[str] = []
-        # 对于 text-generation，多输入时返回 List[List[Dict]]
-        for raw_question, outputs in zip(request.prompts, model_outputs):
-            generated = outputs[0]["generated_text"].strip()
 
-            # 截断可能继续生成的 "Q:" 或下一轮问话
-            for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
-                pos = generated.find(sep)
-                if pos != -1:
-                    generated = generated[:pos].strip()
-                    break
+        # 分片多轮推理：<=BATCH_SIZE 一轮；否则切片多轮
+        for start in range(0, len(batch_questions), BATCH_SIZE):
+            chunk_questions = batch_questions[start : start + BATCH_SIZE]
+            chunk_prompts = [f"Q: {q}\nA:" for q in chunk_questions]
 
-            # 防止答案开头重复问句
-            if generated.startswith(raw_question):
-                generated = generated[len(raw_question) :].strip(" \n:.-")
+            model_outputs = _generator(  # type: ignore[misc]
+                chunk_prompts,
+                max_new_tokens=200,
+                num_return_sequences=1,
+                do_sample=False,
+                return_full_text=False,
+                pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
+                eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
+                batch_size=len(chunk_questions),  # 本轮实际 batch 大小
+            )
 
-            responses.append(generated)
+            for raw_question, outputs in zip(chunk_questions, model_outputs):
+                generated = outputs[0]["generated_text"].strip()
 
-        return PredictResponse(responses=responses)
+                # 截断可能继续生成的 "Q:" 或下一轮问话
+                for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
+                    pos = generated.find(sep)
+                    if pos != -1:
+                        generated = generated[:pos].strip()
+                        break
+
+                # 防止答案开头重复问句
+                if generated.startswith(raw_question):
+                    generated = generated[len(raw_question) :].strip(" \n:.-")
+
+                responses.append(generated)
+        return PredictResponse(response=responses)
 
     # ---------- 单条模式：fallback 到 prompt ----------
-    if not request.prompt:
-        # 既没有 prompt 也没有 prompts，返回空响应以避免 500
-        return PredictResponse(response="")
-
     # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
     prompt = f"Q: {request.prompt}\nA:"
 
     # 使用 max_new_tokens + return_full_text=False 来防止重复 prompt
-    model_output = generator(
+    model_output = _generator(  # type: ignore[misc]
         prompt,
         max_new_tokens=200,  # 生成长度只限制新增内容
         num_return_sequences=1,
         do_sample=False,  # 关闭采样，稳定输出
         return_full_text=False,  # 只返回新增内容
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
+        eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
     )
 
     generated = model_output[0]["generated_text"].strip()
@@ -254,7 +259,7 @@ def predict(request: PromptRequest) -> PredictResponse:
 
     # 防止答案开头重复问句
     if generated.startswith(request.prompt):
-        generated = generated[len(request.prompt):].strip(" \n:.-")
+        generated = generated[len(request.prompt) :].strip(" \n:.-")
 
     return PredictResponse(response=generated)
 
