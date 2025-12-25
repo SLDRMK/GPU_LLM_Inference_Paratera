@@ -216,10 +216,11 @@ def _infer_input_device(model) -> torch.device:
 
 def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     """
-    对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的“token 级截去 prompt”逻辑：
+    对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的"token 级截去 prompt"逻辑：
     - tokenizer(prompts, padding=True, truncation=True, max_length=MAX_INPUT_LENGTH)
     - model.generate(max_new_tokens=MAX_NEW_TOKENS, do_sample=False, ...)
     - 对每条：按非 padding token 数计算 prompt_len，然后 outputs[i][prompt_len:] 解码为答案
+    - 将 <|im_end|> 当作真正的 EOS，删除以后的部分以防止"后话"过长
     """
     ensure_model_loaded()
     tokenizer = _tokenizer  # type: ignore[assignment]
@@ -234,13 +235,25 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
         max_length=MAX_INPUT_LENGTH,
     ).to(device)
 
+    # 配置终止标记：同时把 <|im_end|> 当作 EOS，避免在答案结束后继续生成"后话"
+    # 借鉴 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的处理方式
+    eos_token_id = tokenizer.eos_token_id
+    eos_ids = []
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(tokenizer.eos_token_id)
+    chatml_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if chatml_end_id is not None and chatml_end_id != tokenizer.eos_token_id:
+        eos_ids.append(chatml_end_id)
+    if eos_ids:
+        eos_token_id = eos_ids if len(eos_ids) > 1 else eos_ids[0]
+
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_token_id,
             num_return_sequences=1,
         )
 
@@ -249,13 +262,20 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
         gen_ids = outputs[i]
         inp_ids = inputs["input_ids"][i]
 
-        # 对齐 generate 输出的“前缀长度”：
+        # 对齐 generate 输出的"前缀长度"：
         # model.generate 返回的每条序列前缀长度等于传入的 input_ids 序列长度（包含 padding）。
-        # 若 tokenizer 采用 left padding（decoder-only 常见），用“非 padding token 数”会导致切片起点偏小，
+        # 若 tokenizer 采用 left padding（decoder-only 常见），用"非 padding token 数"会导致切片起点偏小，
         # 进而残留 prompt 尾巴（例如 "...\nA:"）。因此这里统一用完整 input 长度切片，更稳。
         input_seq_len = int(inp_ids.shape[-1])
         new_token_ids = gen_ids[input_seq_len:]
         ans = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+        
+        # 删除 <|im_end|> 及其后面的内容，防止"后话"过长
+        # 借鉴 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的处理方式
+        im_end_pos = ans.find("<|im_end|>")
+        if im_end_pos != -1:
+            ans = ans[:im_end_pos].strip()
+        
         answers.append(ans)
 
     return answers
