@@ -3,15 +3,9 @@ import socket
 from threading import Lock, Thread
 from typing import List, Union
 
-import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-)
+from vllm import LLM, SamplingParams
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -30,11 +24,9 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
 
 
 # 本地模型目录
-# 评测时容器内先运行 download_model.py，会在当前工作目录生成 ./Qwen3-4B
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "./Qwen3-4B")
-
-# 若目录下存在 quantize_meta.json，默认按 bitsandbytes 4bit 方式加载（可用 USE_4BIT=0 强制关闭）
-USE_4BIT = os.getenv("USE_4BIT", "auto").lower()  # auto/1/0
+# 评测时容器内先运行 download_model.py，会在 /app 目录生成 /app/Qwen3-4B
+# 这里默认使用绝对路径，避免 vLLM 子进程 cwd 不同时把相对路径当成 HuggingFace repo id 解析。
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-4B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
@@ -48,29 +40,20 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
 PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 
 _load_lock = Lock()
-_tokenizer = None
-_model = None
-
-
-def _should_use_4bit() -> bool:
-    if USE_4BIT in ("0", "false", "no", "off"):
-        return False
-    if USE_4BIT in ("1", "true", "yes", "on"):
-        return True
-    # auto
-    return os.path.exists(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"))
+_llm: LLM | None = None
+_sampling_params: SamplingParams | None = None
 
 
 def ensure_model_loaded() -> None:
     """
     延迟加载模型，避免容器启动（健康检查阶段）因为加载权重过慢/失败而直接判 Runtime Failed。
     """
-    global _tokenizer, _model
-    if _model is not None and _tokenizer is not None:
+    global _llm, _sampling_params
+    if _llm is not None and _sampling_params is not None:
         return
 
     with _load_lock:
-        if _model is not None and _tokenizer is not None:
+        if _llm is not None and _sampling_params is not None:
             return
 
         # --- 网络连通性测试，仅打印结果 ---
@@ -81,94 +64,45 @@ def ensure_model_loaded() -> None:
         )
 
         # --- 模型加载（完全本地，无网络）---
-        print(f"从本地加载模型：{LOCAL_MODEL_PATH}")
+        print(f"从本地加载模型（vLLM）：{LOCAL_MODEL_PATH}")
 
-        # 加载 tokenizer（仅使用本地文件）
-        # Qwen 系列在不同 transformers/tokenizers 版本组合下，fast tokenizer 可能因为 tokenizer.json 格式差异而解析失败。
-        # 这里做一个稳健回退：先尝试 use_fast=True，失败则回退 use_fast=False（需要 tiktoken）。
-        try:
-            _tokenizer = AutoTokenizer.from_pretrained(
-                LOCAL_MODEL_PATH,
-                local_files_only=True,
-                use_fast=True,
-                trust_remote_code=True,
-            )
-        except Exception as e:
-            print(f"Fast tokenizer 加载失败，将回退到 slow tokenizer。原因：{type(e).__name__}: {e}")
-            _tokenizer = AutoTokenizer.from_pretrained(
-                LOCAL_MODEL_PATH,
-                local_files_only=True,
-                use_fast=False,
-                trust_remote_code=True,
-            )
-        if _tokenizer.pad_token is None:
-            _tokenizer.pad_token = _tokenizer.eos_token
-        # 与 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的推理对齐：
-        # 默认按 right padding（便于用“非 padding token 数”作为 prompt_len 做 token 级切分）
-        try:
-            _tokenizer.padding_side = "right"
-        except Exception:
-            pass
+        # vLLM 会自动处理 tokenizer 和 prompt/token 的对应关系，
+        # 返回结果本身只包含“新生成部分”，无需再手动裁剪 prompt。
+        tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
+        dtype = os.getenv("VLLM_DTYPE", "bfloat16")
+        # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
+        # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
+        # - max_num_seqs：默认可能是 256，这会导致 vLLM warmup 阶段用 256 条 dummy 请求占满显存，这里改为 32。
+        # - gpu_memory_utilization：略微保守，避免把显存吃满导致 OOM。
+        default_max_len = MAX_INPUT_LENGTH + MAX_NEW_TOKENS + 512
+        max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
+        # 默认把并发序列数限制得比较小，避免 vLLM 在 16GB 级别显卡上 warmup 采样器时直接 OOM
+        max_num_seqs = int(os.getenv("VLLM_MAX_NUM_SEQS", "8"))
+        gpu_mem_util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.5"))
 
-        if _should_use_4bit():
-            # 从 quantize_meta.json 读取 compute_dtype（缺省用 float16）
-            compute_dtype = torch.float16
-            try:
-                import json
+        _llm = LLM(
+            model=LOCAL_MODEL_PATH,
+            tokenizer=LOCAL_MODEL_PATH,
+            trust_remote_code=True,
+            tensor_parallel_size=tp_size,
+            dtype=dtype,  # "bfloat16" 在 RTX5090 上更友好
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            gpu_memory_utilization=gpu_mem_util,
+        )
 
-                with open(os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json"), "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                if str(meta.get("compute_dtype", "")).lower() in ("bfloat16", "bf16"):
-                    compute_dtype = torch.bfloat16
-                elif str(meta.get("compute_dtype", "")).lower() in ("float16", "fp16"):
-                    compute_dtype = torch.float16
-                print(f"检测到 4bit 量化模型，启用 bitsandbytes 4bit 加载（compute_dtype={compute_dtype}）。")
-            except Exception as e:
-                print(f"读取 quantize_meta.json 失败，将使用默认 compute_dtype=float16。原因：{type(e).__name__}: {e}")
+        stop_tokens = None
+        if PROMPT_STYLE == "chatml_lora":
+            # ChatML 对话风格：让 vLLM 在 assistant 段结束时自动停掉
+            stop_tokens = ["<|im_end|>"]
 
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-            )
-
-            # 关键：权重已是“预量化”（Linear 权重 dtype=U8，并带 quant_state/absmax 等张量）。
-            # 若走 “量化 on-the-fly”，会把 U8 当成待量化输入触发报错。
-            # 规避：把量化配置写进 config，让 transformers 以“已量化 checkpoint”方式装配 bnb 模块并直接加载权重。
-            cfg = AutoConfig.from_pretrained(
-                LOCAL_MODEL_PATH,
-                local_files_only=True,
-                trust_remote_code=True,
-            )
-            try:
-                cfg.quantization_config = bnb_config.to_dict()  # type: ignore[attr-defined]
-            except Exception:
-                cfg.quantization_config = bnb_config  # type: ignore[attr-defined]
-
-            _model = AutoModelForCausalLM.from_pretrained(
-                LOCAL_MODEL_PATH,
-                local_files_only=True,
-                trust_remote_code=True,
-                config=cfg,
-                device_map="auto",
-                torch_dtype=compute_dtype,
-            )
-        else:
-            _model = AutoModelForCausalLM.from_pretrained(
-                LOCAL_MODEL_PATH,
-                local_files_only=True,
-                trust_remote_code=True,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-                device_map=None,
-            )
-            try:
-                _model.to("cuda:0")
-            except Exception:
-                _model.to("cpu")
-
-        # 注意：这里不再构造 transformers.pipeline，而是像 run_inference_eval.py 一样直接走 tokenizer + model.generate，
-        # 以便使用 token 级切分把 prompt 从输出里剥离（更稳、更可控）。
+        _sampling_params = SamplingParams(
+            max_tokens=MAX_NEW_TOKENS,
+            temperature=0.0,
+            top_p=1.0,
+            n=1,
+            stop=stop_tokens,
+        )
 
 
 def build_prompt(question: str) -> str:
@@ -184,51 +118,6 @@ def build_prompt(question: str) -> str:
     return f"Q: {question}\nA:"
 
 
-def strip_prompt_from_output(generated_text: str, prompt_text: str, raw_question: str) -> str:
-    """
-    与 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的后处理逻辑对齐：
-    - 优先把完整 prompt 从输出里剥离（有些模型/版本会回显 prompt）
-    - 再做一次“问句回显”兜底剥离
-    """
-    text = (generated_text or "").strip()
-
-    # 1) 优先剥离 prompt（只剥离最前面的那一段）
-    if prompt_text and text.startswith(prompt_text):
-        text = text[len(prompt_text) :].lstrip()
-    elif prompt_text and prompt_text in text:
-        # 兼容 prompt 不在开头但仍被回显的情况：只移除第一次出现
-        idx = text.find(prompt_text)
-        if idx != -1:
-            text = (text[:idx] + text[idx + len(prompt_text) :]).strip()
-
-    # 2) 兜底：剥离问句本身（避免答案开头重复问句）
-    if raw_question and text.startswith(raw_question):
-        text = text[len(raw_question) :].lstrip(" \n:.-")
-
-    return text.strip()
-
-
-def _infer_input_device(model) -> torch.device:
-    """
-    推理输入应放到模型所在设备：
-    - 普通单卡：model.device 或首个参数 device
-    - device_map="auto"：输入通常放到第一层所在设备（首个参数 device）
-    """
-    try:
-        d = getattr(model, "device", None)
-        if isinstance(d, torch.device):
-            return d
-    except Exception:
-        pass
-    try:
-        for p in model.parameters():
-            if hasattr(p, "device"):
-                return p.device
-    except Exception:
-        pass
-    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-
 def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     """
     对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的"token 级截去 prompt"逻辑：
@@ -237,53 +126,18 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     - 对每条：按非 padding token 数计算 prompt_len，然后 outputs[i][prompt_len:] 解码为答案
     """
     ensure_model_loaded()
-    tokenizer = _tokenizer  # type: ignore[assignment]
-    model = _model  # type: ignore[assignment]
-    device = _infer_input_device(model)
+    assert _llm is not None and _sampling_params is not None
 
-    inputs = tokenizer(
-        prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MAX_INPUT_LENGTH,
-    ).to(device)
-
-    # 配置终止标记：完全对齐 run_inference_eval.py
-    eos_token_id = tokenizer.eos_token_id
-    if PROMPT_STYLE == "chatml_lora":
-        eos_ids = []
-        if tokenizer.eos_token_id is not None:
-            eos_ids.append(tokenizer.eos_token_id)
-        chatml_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        if chatml_end_id is not None and chatml_end_id != tokenizer.eos_token_id:
-            eos_ids.append(chatml_end_id)
-        if eos_ids:
-            eos_token_id = eos_ids
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=eos_token_id,
-            num_return_sequences=1,
-        )
+    # vLLM 的 generate 接口本身就是批量化的，返回的 text 只包含“新生成 token”
+    outputs = _llm.generate(prompts, _sampling_params)
 
     answers: List[str] = []
-    for i in range(outputs.size(0)):
-        gen_ids = outputs[i]
-        inp_ids = inputs["input_ids"][i]
-
-        # 完全对齐 run_inference_eval.py：用“非 padding token 数”估算实际 prompt 长度
-        if tokenizer.pad_token_id is not None:
-            prompt_len = int((inp_ids != tokenizer.pad_token_id).sum().item())
-        else:
-            prompt_len = int(inp_ids.shape[-1])
-        new_token_ids = gen_ids[prompt_len:]
-        ans = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
-        answers.append(ans)
+    for out in outputs:
+        if not out.outputs:
+            answers.append("")
+            continue
+        text = out.outputs[0].text or ""
+        answers.append(text.strip())
 
     return answers
 

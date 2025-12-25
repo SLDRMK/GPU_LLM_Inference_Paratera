@@ -131,6 +131,16 @@ sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 sudo docker build -t paratera-demo:latest .
 ```
 
+> 说明：
+> - 默认构建会执行 `pip install -r requirements.txt` 和 `python3 download_model.py`，保证容器内依赖与模型齐全。
+> - 若仅在本地反复调试代码、且之前已经成功完整构建过一次，可以通过构建参数 **跳过安装与下载** 来加速：
+>
+> ```bash
+> sudo docker build -t paratera-demo:latest . --build-arg SKIP_SETUP=1
+> ```
+>
+> - 评测平台上请使用默认构建方式（不要传 `SKIP_SETUP=1`），否则镜像内可能没有模型和依赖。
+
 **重新构建镜像**（当代码或依赖有更新时）：
 
 如果需要完全重新构建（不使用缓存），可以执行：
