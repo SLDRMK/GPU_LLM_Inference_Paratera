@@ -37,11 +37,15 @@ LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "./Qwen3-4B")
 USE_4BIT = os.getenv("USE_4BIT", "auto").lower()  # auto/1/0
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
 MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "1024"))
 # 每条最多生成多少新 token（对齐 run_inference_eval.py 默认）
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
+# Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
+# - medical_qa: Q: ...\nA:
+# - chatml_lora: ChatML system/user/assistant
+PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 
 _load_lock = Lock()
 _tokenizer = None
@@ -99,6 +103,12 @@ def ensure_model_loaded() -> None:
             )
         if _tokenizer.pad_token is None:
             _tokenizer.pad_token = _tokenizer.eos_token
+        # 与 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的推理对齐：
+        # 默认按 right padding（便于用“非 padding token 数”作为 prompt_len 做 token 级切分）
+        try:
+            _tokenizer.padding_side = "right"
+        except Exception:
+            pass
 
         if _should_use_4bit():
             # 从 quantize_meta.json 读取 compute_dtype（缺省用 float16）
@@ -161,11 +171,16 @@ def ensure_model_loaded() -> None:
         # 以便使用 token 级切分把 prompt 从输出里剥离（更稳、更可控）。
 
 
-def build_medical_prompt(question: str) -> str:
+def build_prompt(question: str) -> str:
     """
-    与 /home/sldrmk/WorkSpace/GPU_LLM/medical_llm_finetune.py 中 build_medical_prompt 对齐：
-    形如：Q: <question>\\nA:
+    与 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的 _build_prompt 对齐：
+    - medical_qa: Q: <question>\\nA:
+    - chatml_lora: 对齐 excluded/Lora_finetune.py 的 ChatML + system/user/assistant 格式
     """
+    if PROMPT_STYLE == "chatml_lora":
+        system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        user_content = question
+        return f"{system_prompt}<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
     return f"Q: {question}\nA:"
 
 
@@ -220,7 +235,6 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     - tokenizer(prompts, padding=True, truncation=True, max_length=MAX_INPUT_LENGTH)
     - model.generate(max_new_tokens=MAX_NEW_TOKENS, do_sample=False, ...)
     - 对每条：按非 padding token 数计算 prompt_len，然后 outputs[i][prompt_len:] 解码为答案
-    - 将 <|im_end|> 当作真正的 EOS，删除以后的部分以防止"后话"过长
     """
     ensure_model_loaded()
     tokenizer = _tokenizer  # type: ignore[assignment]
@@ -235,17 +249,17 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
         max_length=MAX_INPUT_LENGTH,
     ).to(device)
 
-    # 配置终止标记：同时把 <|im_end|> 当作 EOS，避免在答案结束后继续生成"后话"
-    # 借鉴 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的处理方式
+    # 配置终止标记：完全对齐 run_inference_eval.py
     eos_token_id = tokenizer.eos_token_id
-    eos_ids = []
-    if tokenizer.eos_token_id is not None:
-        eos_ids.append(tokenizer.eos_token_id)
-    chatml_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    if chatml_end_id is not None and chatml_end_id != tokenizer.eos_token_id:
-        eos_ids.append(chatml_end_id)
-    if eos_ids:
-        eos_token_id = eos_ids if len(eos_ids) > 1 else eos_ids[0]
+    if PROMPT_STYLE == "chatml_lora":
+        eos_ids = []
+        if tokenizer.eos_token_id is not None:
+            eos_ids.append(tokenizer.eos_token_id)
+        chatml_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if chatml_end_id is not None and chatml_end_id != tokenizer.eos_token_id:
+            eos_ids.append(chatml_end_id)
+        if eos_ids:
+            eos_token_id = eos_ids
 
     with torch.inference_mode():
         outputs = model.generate(
@@ -262,20 +276,13 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
         gen_ids = outputs[i]
         inp_ids = inputs["input_ids"][i]
 
-        # 对齐 generate 输出的"前缀长度"：
-        # model.generate 返回的每条序列前缀长度等于传入的 input_ids 序列长度（包含 padding）。
-        # 若 tokenizer 采用 left padding（decoder-only 常见），用"非 padding token 数"会导致切片起点偏小，
-        # 进而残留 prompt 尾巴（例如 "...\nA:"）。因此这里统一用完整 input 长度切片，更稳。
-        input_seq_len = int(inp_ids.shape[-1])
-        new_token_ids = gen_ids[input_seq_len:]
+        # 完全对齐 run_inference_eval.py：用“非 padding token 数”估算实际 prompt 长度
+        if tokenizer.pad_token_id is not None:
+            prompt_len = int((inp_ids != tokenizer.pad_token_id).sum().item())
+        else:
+            prompt_len = int(inp_ids.shape[-1])
+        new_token_ids = gen_ids[prompt_len:]
         ans = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
-        
-        # 删除 <|im_end|> 及其后面的内容，防止"后话"过长
-        # 借鉴 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的处理方式
-        im_end_pos = ans.find("<|im_end|>")
-        if im_end_pos != -1:
-            ans = ans[:im_end_pos].strip()
-        
         answers.append(ans)
 
     return answers
@@ -336,37 +343,17 @@ def predict(request: PromptRequest) -> PredictResponse:
         # 分片多轮推理：<=BATCH_SIZE 一轮；否则切片多轮
         for start in range(0, len(batch_questions), BATCH_SIZE):
             chunk_questions = batch_questions[start : start + BATCH_SIZE]
-            chunk_prompts = [build_medical_prompt(q) for q in chunk_questions]
+            chunk_prompts = [build_prompt(q) for q in chunk_questions]
 
             chunk_answers = generate_answers_from_prompts(chunk_prompts)
-            for raw_question, prompt_text, ans in zip(chunk_questions, chunk_prompts, chunk_answers):
-                generated = strip_prompt_from_output(ans, prompt_text, raw_question)
-
-                # 截断可能继续生成的 "Q:" 或下一轮问话
-                for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
-                    pos = generated.find(sep)
-                    if pos != -1:
-                        generated = generated[:pos].strip()
-                        break
-
-                responses.append(generated)
+            # 对齐 run_inference_eval.py：token 级切分后直接返回答案，不再做额外字符串截断
+            responses.extend([a.strip() for a in chunk_answers])
         return PredictResponse(response=responses)
 
     # ---------- 单条模式：fallback 到 prompt ----------
-    # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
-    prompt = build_medical_prompt(request.prompt)
-
+    prompt = build_prompt(request.prompt)
     generated = generate_answers_from_prompts([prompt])[0]
-    generated = strip_prompt_from_output(generated, prompt, request.prompt)
-
-    # 截断可能继续生成的 "Q:" 或下一轮问话
-    for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
-        pos = generated.find(sep)
-        if pos != -1:
-            generated = generated[:pos].strip()
-            break
-
-    return PredictResponse(response=generated)
+    return PredictResponse(response=generated.strip())
 
 
 @app.get("/")
