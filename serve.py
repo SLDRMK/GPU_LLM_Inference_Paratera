@@ -11,8 +11,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    pipeline,
-    set_seed,
 )
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
@@ -40,11 +38,14 @@ USE_4BIT = os.getenv("USE_4BIT", "auto").lower()  # auto/1/0
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
+# 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
+MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "1024"))
+# 每条最多生成多少新 token（对齐 run_inference_eval.py 默认）
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
 
 _load_lock = Lock()
 _tokenizer = None
 _model = None
-_generator = None
 
 
 def _should_use_4bit() -> bool:
@@ -60,12 +61,12 @@ def ensure_model_loaded() -> None:
     """
     延迟加载模型，避免容器启动（健康检查阶段）因为加载权重过慢/失败而直接判 Runtime Failed。
     """
-    global _tokenizer, _model, _generator
-    if _generator is not None:
+    global _tokenizer, _model
+    if _model is not None and _tokenizer is not None:
         return
 
     with _load_lock:
-        if _generator is not None:
+        if _model is not None and _tokenizer is not None:
             return
 
         # --- 网络连通性测试，仅打印结果 ---
@@ -156,17 +157,8 @@ def ensure_model_loaded() -> None:
             except Exception:
                 _model.to("cpu")
 
-        pipeline_kwargs = {
-            "task": "text-generation",
-            "model": _model,
-            "tokenizer": _tokenizer,
-        }
-        # 若模型是通过 device_map="auto" 加载（accelerate 管理设备），pipeline 不能再传 device 参数
-        if not hasattr(_model, "hf_device_map"):
-            pipeline_kwargs["device"] = 0 if torch.cuda.is_available() else -1
-
-        _generator = pipeline(**pipeline_kwargs)
-        set_seed(42)
+        # 注意：这里不再构造 transformers.pipeline，而是像 run_inference_eval.py 一样直接走 tokenizer + model.generate，
+        # 以便使用 token 级切分把 prompt 从输出里剥离（更稳、更可控）。
 
 
 def build_medical_prompt(question: str) -> str:
@@ -199,6 +191,74 @@ def strip_prompt_from_output(generated_text: str, prompt_text: str, raw_question
         text = text[len(raw_question) :].lstrip(" \n:.-")
 
     return text.strip()
+
+
+def _infer_input_device(model) -> torch.device:
+    """
+    推理输入应放到模型所在设备：
+    - 普通单卡：model.device 或首个参数 device
+    - device_map="auto"：输入通常放到第一层所在设备（首个参数 device）
+    """
+    try:
+        d = getattr(model, "device", None)
+        if isinstance(d, torch.device):
+            return d
+    except Exception:
+        pass
+    try:
+        for p in model.parameters():
+            if hasattr(p, "device"):
+                return p.device
+    except Exception:
+        pass
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
+    """
+    对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的“token 级截去 prompt”逻辑：
+    - tokenizer(prompts, padding=True, truncation=True, max_length=MAX_INPUT_LENGTH)
+    - model.generate(max_new_tokens=MAX_NEW_TOKENS, do_sample=False, ...)
+    - 对每条：按非 padding token 数计算 prompt_len，然后 outputs[i][prompt_len:] 解码为答案
+    """
+    ensure_model_loaded()
+    tokenizer = _tokenizer  # type: ignore[assignment]
+    model = _model  # type: ignore[assignment]
+    device = _infer_input_device(model)
+
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=MAX_INPUT_LENGTH,
+    ).to(device)
+
+    with torch.inference_mode():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            num_return_sequences=1,
+        )
+
+    answers: List[str] = []
+    for i in range(outputs.size(0)):
+        gen_ids = outputs[i]
+        inp_ids = inputs["input_ids"][i]
+
+        # 对齐 generate 输出的“前缀长度”：
+        # model.generate 返回的每条序列前缀长度等于传入的 input_ids 序列长度（包含 padding）。
+        # 若 tokenizer 采用 left padding（decoder-only 常见），用“非 padding token 数”会导致切片起点偏小，
+        # 进而残留 prompt 尾巴（例如 "...\nA:"）。因此这里统一用完整 input 长度切片，更稳。
+        input_seq_len = int(inp_ids.shape[-1])
+        new_token_ids = gen_ids[input_seq_len:]
+        ans = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+        answers.append(ans)
+
+    return answers
 
 
 # --- API 定义 ---
@@ -258,20 +318,9 @@ def predict(request: PromptRequest) -> PredictResponse:
             chunk_questions = batch_questions[start : start + BATCH_SIZE]
             chunk_prompts = [build_medical_prompt(q) for q in chunk_questions]
 
-            model_outputs = _generator(  # type: ignore[misc]
-                chunk_prompts,
-                max_new_tokens=200,
-                num_return_sequences=1,
-                do_sample=False,
-                return_full_text=True,
-                pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
-                eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
-                batch_size=len(chunk_questions),  # 本轮实际 batch 大小
-            )
-
-            for raw_question, prompt_text, outputs in zip(chunk_questions, chunk_prompts, model_outputs):
-                generated = outputs[0]["generated_text"].strip()
-                generated = strip_prompt_from_output(generated, prompt_text, raw_question)
+            chunk_answers = generate_answers_from_prompts(chunk_prompts)
+            for raw_question, prompt_text, ans in zip(chunk_questions, chunk_prompts, chunk_answers):
+                generated = strip_prompt_from_output(ans, prompt_text, raw_question)
 
                 # 截断可能继续生成的 "Q:" 或下一轮问话
                 for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
@@ -287,18 +336,7 @@ def predict(request: PromptRequest) -> PredictResponse:
     # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
     prompt = build_medical_prompt(request.prompt)
 
-    # 使用 max_new_tokens + return_full_text=False 来防止重复 prompt
-    model_output = _generator(  # type: ignore[misc]
-        prompt,
-        max_new_tokens=200,  # 生成长度只限制新增内容
-        num_return_sequences=1,
-        do_sample=False,  # 关闭采样，稳定输出
-        return_full_text=True,
-        pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
-        eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
-    )
-
-    generated = model_output[0]["generated_text"].strip()
+    generated = generate_answers_from_prompts([prompt])[0]
     generated = strip_prompt_from_output(generated, prompt, request.prompt)
 
     # 截断可能继续生成的 "Q:" 或下一轮问话
