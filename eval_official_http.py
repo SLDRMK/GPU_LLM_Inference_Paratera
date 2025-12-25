@@ -281,7 +281,7 @@ def main():
     p.add_argument(
         "--request_chunk_size",
         type=int,
-        default=4,
+        default=100,
         help="把 /predict 的 prompt 列表按该大小拆成多次 HTTP 调用（默认 4，对齐 run_inference_eval.py 的 batch_size 默认）。",
     )
     p.add_argument("--no_start_server", action="store_true", help="不启动本地 uvicorn，只对已有服务发请求")
