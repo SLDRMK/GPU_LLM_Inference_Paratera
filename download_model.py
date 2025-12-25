@@ -12,7 +12,7 @@ from modelscope import snapshot_download
 def main():
     # ModelScope 仓库名
     # 4bit(bnb) 量化版本（你后续将上传到该 repo）
-    model_repo = "SLDRMK/Qwen3-4B-realistic-400-500"
+    model_repo = "SLDRMK/Qwen3-4B-realistic-final"
 
     # snapshot_download 会返回本地模型目录路径
     # 这里将 cache_dir 与 local_dir 显式指定为当前目录下的 Qwen3-4B 目录

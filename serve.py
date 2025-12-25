@@ -169,6 +169,38 @@ def ensure_model_loaded() -> None:
         set_seed(42)
 
 
+def build_medical_prompt(question: str) -> str:
+    """
+    与 /home/sldrmk/WorkSpace/GPU_LLM/medical_llm_finetune.py 中 build_medical_prompt 对齐：
+    形如：Q: <question>\\nA:
+    """
+    return f"Q: {question}\nA:"
+
+
+def strip_prompt_from_output(generated_text: str, prompt_text: str, raw_question: str) -> str:
+    """
+    与 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的后处理逻辑对齐：
+    - 优先把完整 prompt 从输出里剥离（有些模型/版本会回显 prompt）
+    - 再做一次“问句回显”兜底剥离
+    """
+    text = (generated_text or "").strip()
+
+    # 1) 优先剥离 prompt（只剥离最前面的那一段）
+    if prompt_text and text.startswith(prompt_text):
+        text = text[len(prompt_text) :].lstrip()
+    elif prompt_text and prompt_text in text:
+        # 兼容 prompt 不在开头但仍被回显的情况：只移除第一次出现
+        idx = text.find(prompt_text)
+        if idx != -1:
+            text = (text[:idx] + text[idx + len(prompt_text) :]).strip()
+
+    # 2) 兜底：剥离问句本身（避免答案开头重复问句）
+    if raw_question and text.startswith(raw_question):
+        text = text[len(raw_question) :].lstrip(" \n:.-")
+
+    return text.strip()
+
+
 # --- API 定义 ---
 app = FastAPI(
     title="Simple Inference Server",
@@ -224,21 +256,22 @@ def predict(request: PromptRequest) -> PredictResponse:
         # 分片多轮推理：<=BATCH_SIZE 一轮；否则切片多轮
         for start in range(0, len(batch_questions), BATCH_SIZE):
             chunk_questions = batch_questions[start : start + BATCH_SIZE]
-            chunk_prompts = [f"Q: {q}\nA:" for q in chunk_questions]
+            chunk_prompts = [build_medical_prompt(q) for q in chunk_questions]
 
             model_outputs = _generator(  # type: ignore[misc]
                 chunk_prompts,
                 max_new_tokens=200,
                 num_return_sequences=1,
                 do_sample=False,
-                return_full_text=False,
+                return_full_text=True,
                 pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
                 eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
                 batch_size=len(chunk_questions),  # 本轮实际 batch 大小
             )
 
-            for raw_question, outputs in zip(chunk_questions, model_outputs):
+            for raw_question, prompt_text, outputs in zip(chunk_questions, chunk_prompts, model_outputs):
                 generated = outputs[0]["generated_text"].strip()
+                generated = strip_prompt_from_output(generated, prompt_text, raw_question)
 
                 # 截断可能继续生成的 "Q:" 或下一轮问话
                 for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
@@ -247,16 +280,12 @@ def predict(request: PromptRequest) -> PredictResponse:
                         generated = generated[:pos].strip()
                         break
 
-                # 防止答案开头重复问句
-                if generated.startswith(raw_question):
-                    generated = generated[len(raw_question) :].strip(" \n:.-")
-
                 responses.append(generated)
         return PredictResponse(response=responses)
 
     # ---------- 单条模式：fallback 到 prompt ----------
     # 与 /root/medical-llm-finetune/medical_llm_finetune.py 中 build_medical_prompt 完全对齐
-    prompt = f"Q: {request.prompt}\nA:"
+    prompt = build_medical_prompt(request.prompt)
 
     # 使用 max_new_tokens + return_full_text=False 来防止重复 prompt
     model_output = _generator(  # type: ignore[misc]
@@ -264,12 +293,13 @@ def predict(request: PromptRequest) -> PredictResponse:
         max_new_tokens=200,  # 生成长度只限制新增内容
         num_return_sequences=1,
         do_sample=False,  # 关闭采样，稳定输出
-        return_full_text=False,  # 只返回新增内容
+        return_full_text=True,
         pad_token_id=_tokenizer.pad_token_id,  # type: ignore[union-attr]
         eos_token_id=_tokenizer.eos_token_id,  # type: ignore[union-attr]
     )
 
     generated = model_output[0]["generated_text"].strip()
+    generated = strip_prompt_from_output(generated, prompt, request.prompt)
 
     # 截断可能继续生成的 "Q:" 或下一轮问话
     for sep in ["\nQ:", "\nQ ", "Q:", "\nQuestion:", "\n\nQ:"]:
@@ -277,10 +307,6 @@ def predict(request: PromptRequest) -> PredictResponse:
         if pos != -1:
             generated = generated[:pos].strip()
             break
-
-    # 防止答案开头重复问句
-    if generated.startswith(request.prompt):
-        generated = generated[len(request.prompt) :].strip(" \n:.-")
 
     return PredictResponse(response=generated)
 
