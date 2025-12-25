@@ -178,15 +178,7 @@ def build_prompt(question: str) -> str:
     - chatml_lora: 对齐 excluded/Lora_finetune.py 的 ChatML + system/user/assistant 格式
     """
     if PROMPT_STYLE == "chatml_lora":
-        # 对齐 run_inference_eval.py 的 ChatML 框架，同时加入“用自己的话回答、避免逐字照抄”的约束，
-        # 这属于正当的生成风格控制（避免背题式复述），而不是在输出末尾追加无关噪声。
-        system_prompt = (
-            "<|im_start|>system\n"
-            "You are a helpful assistant.\n"
-            "Please answer in your own words and do not copy the dataset or any memorized reference verbatim.\n"
-            "Keep the answer professional and concise. Start your final answer with '答：'.\n"
-            "<|im_end|>\n"
-        )
+        system_prompt = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         user_content = question
         return f"{system_prompt}<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
     return f"Q: {question}\nA:"
@@ -296,18 +288,6 @@ def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     return answers
 
 
-def format_answer(ans: str) -> str:
-    """
-    轻量的格式化：确保以“答：”开头（相关内容，不是无关噪声），并做首尾空白清理。
-    """
-    a = (ans or "").strip()
-    if not a:
-        return "答："
-    if a.startswith("答："):
-        return a
-    return "答：" + a
-
-
 # --- API 定义 ---
 app = FastAPI(
     title="Simple Inference Server",
@@ -367,13 +347,13 @@ def predict(request: PromptRequest) -> PredictResponse:
 
             chunk_answers = generate_answers_from_prompts(chunk_prompts)
             # 对齐 run_inference_eval.py：token 级切分后直接返回答案，不再做额外字符串截断
-            responses.extend([format_answer(a) for a in chunk_answers])
+            responses.extend([a.strip() for a in chunk_answers])
         return PredictResponse(response=responses)
 
     # ---------- 单条模式：fallback 到 prompt ----------
     prompt = build_prompt(request.prompt)
     generated = generate_answers_from_prompts([prompt])[0]
-    return PredictResponse(response=format_answer(generated))
+    return PredictResponse(response=generated.strip())
 
 
 @app.get("/")

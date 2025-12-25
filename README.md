@@ -167,6 +167,26 @@ sudo docker run --rm -p 8000:8000 paratera-demo:latest
 sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 paratera-demo:latest
 ```
 
+## 评测平台（judge）等价运行指令（默认端口 8000）
+
+评测平台会先对 `GET /` 做健康检查，然后用 `POST /predict` 做推理。
+
+建议用下面这条命令本地“等价模拟评测运行”（默认端口 **8000**）：
+
+```bash
+sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -e PROMPT_STYLE=chatml_lora \
+  -e BATCH_SIZE=4 \
+  -e MAX_INPUT_LENGTH=1024 \
+  -e MAX_NEW_TOKENS=200 \
+  -p 8000:8000 \
+  paratera-demo:latest
+```
+
+> 说明：
+> - `PROMPT_STYLE` 默认就是 `chatml_lora`，这里显式写出便于确认与评测脚本一致。
+> - `BATCH_SIZE` 建议先从 `4` 开始（对齐本地评测脚本默认），避免一次性 batch 过大导致显存 OOM。
+
 ### 5) 接口验证（符合评测契约）
 
 健康检查：
@@ -181,6 +201,41 @@ curl -s http://127.0.0.1:8000/ ; echo
 curl -s -X POST http://127.0.0.1:8000/predict \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"你好，简单自我介绍一下"}' ; echo
+```
+
+评测 batch 模式契约：`POST /predict` + `{"prompt":[...]}，返回 {"response":[...]}`：
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/predict" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":["问题1：你好","问题2：给我一句话总结Transformer","问题3：1+1等于几？"]}' ; echo
+```
+
+## 一键评测（official_test.txt * N）：ROUGE-L 与 tokens/s
+
+仓库内提供 `eval_official_http.py`，会解析 `official_test.txt`，复制多遍后以 batch 方式调用 `/predict`，
+并计算 **ROUGE-L(F1)** 与 **tokens/s**（tokens/s 需要本地可见的模型目录用于 tokenizer 统计）。
+
+示例（服务已在本机 `8000` 端口运行）：
+
+```bash
+conda activate gpu_llm
+python eval_official_http.py \
+  --no_start_server \
+  --server_url http://127.0.0.1:8000 \
+  --repeat 1 \
+  --model_path /home/sldrmk/WorkSpace/GPU_LLM/out/Qwen3-4B-realistic-bnb4bit-final
+```
+
+如果推理时出现 500/显存 OOM，可把 HTTP 请求也再拆小一点：
+
+```bash
+python eval_official_http.py \
+  --no_start_server \
+  --server_url http://127.0.0.1:8000 \
+  --repeat 3 \
+  --request_chunk_size 4 \
+  --model_path /home/sldrmk/WorkSpace/GPU_LLM/out/Qwen3-4B-realistic-bnb4bit-final
 ```
 
 ### 6) 模型文件位置
