@@ -1,6 +1,8 @@
 fastapi==0.127.0
 uvicorn>=0.24.0
-pydantic==2.11.2
+# 与基础镜像内 vllm==0.11.0 / openai-harmony 对齐，避免被 requirements 强制降级：
+# 基础镜像中已有 pydantic>=2.11.7，这里只要求下限，不再固定为 2.11.2。
+pydantic>=2.11.7
 transformers==4.57.3
 tokenizers==0.22.1
 modelscope>=1.18.0

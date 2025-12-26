@@ -82,17 +82,9 @@ docker run - predict stage: 360s
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y ca-certificates curl gnupg
-sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-sudo chmod a+r /etc/apt/keyrings/docker.gpg
-
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" | \
-  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo apt-get install -y docker.io
 sudo systemctl enable --now docker
+docker --version
 ```
 
 > 说明：如果不想每次都 `sudo docker ...`，可将当前用户加入 `docker` 组后重新登录：
@@ -106,7 +98,9 @@ sudo systemctl enable --now docker
 若运行容器时出现 “NVIDIA Driver was not detected / GPU functionality will not be available”，通常是未安装或未配置 NVIDIA Container Toolkit。
 
 ```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+  sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
   sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
   sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
@@ -125,21 +119,36 @@ sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 
 ### 3) 构建镜像
 
-在项目根目录执行：
+在项目根目录执行（**本地推荐使用宿主机网络进行构建**）：
 
 ```bash
-sudo docker build -t paratera-demo:latest .
+# 本地/自有机器（推荐）：使用宿主机网络 + 自定义 pip 源
+sudo docker build --network host \
+  -t paratera-demo:latest . \
+  --build-arg PIP_INDEX_URL=https://pypi.org/simple
 ```
 
 > 说明：
-> - 默认构建会执行 `pip install -r requirements.txt` 和 `python3 download_model.py`，保证容器内依赖与模型齐全。
+> - Dockerfile 中支持两个构建参数：
+>   - **`SKIP_SETUP`**：默认为 `0`。当为 `1` 时会跳过 `pip install -r requirements.txt` 和 `python3 download_model.py`（只适合**本地已完整构建过一次后的快速调试**）。
+>   - **`PIP_INDEX_URL`**：用于覆盖容器内 pip 的 index-url，默认值为清华镜像 `https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple`。
+> - 像本机环境这样的场景，如果发现清华源访问不稳定，可以改用官方 PyPI 或其他镜像，例如：
+> 
+>   ```bash
+>   sudo docker build --network host \
+>     -t paratera-demo:latest . \
+>     --build-arg PIP_INDEX_URL=https://pypi.org/simple
+>   ```
+> 
 > - 若仅在本地反复调试代码、且之前已经成功完整构建过一次，可以通过构建参数 **跳过安装与下载** 来加速：
->
-> ```bash
-> sudo docker build -t paratera-demo:latest . --build-arg SKIP_SETUP=1
-> ```
->
-> - 评测平台上请使用默认构建方式（不要传 `SKIP_SETUP=1`），否则镜像内可能没有模型和依赖。
+> 
+>   ```bash
+>   sudo docker build --network host \
+>     -t paratera-demo:latest . \
+>     --build-arg SKIP_SETUP=1
+>   ```
+> 
+> - **评测平台（judge）上**：通常会使用平台侧配置好的网络和镜像源，你只需保证 Dockerfile 正常，**不要修改评测系统默认的构建命令，也不要在评测配置里强行加入 `SKIP_SETUP=1`**，否则镜像内可能没有模型和依赖。
 
 **重新构建镜像**（当代码或依赖有更新时）：
 
@@ -154,13 +163,17 @@ sudo docker ps -a | grep paratera-demo | awk '{print $1}' | xargs -r sudo docker
 sudo docker rmi paratera-demo:latest
 
 # 重新构建镜像（不使用缓存）
-sudo docker build --no-cache -t paratera-demo:latest .
+sudo docker build --network host --no-cache \
+  -t paratera-demo:latest . \
+  --build-arg PIP_INDEX_URL=https://pypi.org/simple
 ```
 
 或者简单方式（仅重新构建，保留旧镜像）：
 
 ```bash
-sudo docker build -t paratera-demo:latest .
+sudo docker build --network host \
+  -t paratera-demo:latest . \
+  --build-arg PIP_INDEX_URL=https://pypi.org/simple
 ```
 
 ### 4) 启动容器（CPU / GPU）

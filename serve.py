@@ -104,6 +104,36 @@ def ensure_model_loaded() -> None:
             stop=stop_tokens,
         )
 
+        # --- 轻量级 warmup：触发一次 generate，提前完成 kernel / cache 初始化 ---
+        # 可通过 VLLM_DISABLE_WARMUP=1 关闭（例如在显存特别紧张的调试环境）。
+        disable_warmup = os.getenv("VLLM_DISABLE_WARMUP", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not disable_warmup:
+            try:
+                warmup_batch = min(4, BATCH_SIZE)
+                warmup_prompts = ["Warmup prompt"] * warmup_batch
+                warmup_max_tokens = min(8, MAX_NEW_TOKENS)
+                warmup_params = SamplingParams(
+                    max_tokens=warmup_max_tokens,
+                    temperature=0.0,
+                    top_p=1.0,
+                    n=1,
+                    stop=stop_tokens,
+                )
+                print(
+                    f"Warmup generate: batch={warmup_batch}, max_tokens={warmup_max_tokens}, "
+                    f"max_num_seqs={max_num_seqs}, gpu_mem_util={gpu_mem_util}"
+                )
+                _llm.generate(warmup_prompts, warmup_params)
+                print("Warmup generate: done.")
+            except Exception as e:
+                # 预热失败不应影响正常推理；后续首个真实请求仍会完成初始化。
+                print(f"Warmup generate failed (ignored): {type(e).__name__}: {e}")
+
 
 def build_prompt(question: str) -> str:
     """
