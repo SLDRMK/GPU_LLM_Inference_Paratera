@@ -230,16 +230,21 @@ def run_eval(
     )
 
 
-def wait_server_ready(server_url: str, timeout_s: float = 60.0) -> None:
+def wait_server_ready(server_url: str, timeout_s: float = 420.0) -> None:
     deadline = time.time() + timeout_s
     last_err = None
     while time.time() < deadline:
         try:
-            _ = http_get_json(f"{server_url.rstrip('/')}/", timeout=2.0)
-            return
+            info = http_get_json(f"{server_url.rstrip('/')}/", timeout=2.0)
+            # 约定：当 / 返回 {"status": "batch"} 或 {"status": "ok"} 时视为 ready；
+            # 其它状态（如 initializing）继续轮询。
+            status = str(info.get("status", "")).strip().lower()
+            if status in ("batch", "ok"):
+                return
+            last_err = RuntimeError(f"/ 返回状态 {status!r}，尚未 ready")
         except Exception as e:
             last_err = e
-            time.sleep(0.5)
+        time.sleep(0.5)
     raise RuntimeError(f"等待服务就绪超时（{timeout_s}s）：{last_err}")
 
 
@@ -266,7 +271,15 @@ def start_server_subprocess(
 def main():
     p = argparse.ArgumentParser(description="启动 serve.py 并用 official_test.txt*3 评测 ROUGE-L 与 tokens/s")
     p.add_argument("--workdir", type=str, default=os.path.dirname(os.path.abspath(__file__)))
-    p.add_argument("--official_test", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "official_test.txt"))
+    p.add_argument(
+        "--official_test",
+        type=str,
+        default=os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "official_test_358.txt",
+        ),
+    )
+    # 默认配置与 README 中推荐的 384 batch 评测参数保持一致
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--host", type=str, default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
@@ -274,15 +287,15 @@ def main():
     p.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LOCAL_MODEL_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "Qwen3-4B")),
+        default=os.getenv("LOCAL_MODEL_PATH", os.path.expanduser("~/data/models/Qwen3-4B")),
         help="用于本地统计 tokens/s 的模型目录（需为宿主机可见的本地路径）。",
     )
     p.add_argument("--timeout", type=float, default=360.0)
     p.add_argument(
         "--request_chunk_size",
         type=int,
-        default=100,
-        help="把 /predict 的 prompt 列表按该大小拆成多次 HTTP 调用（默认 4，对齐 run_inference_eval.py 的 batch_size 默认）。",
+        default=384,
+        help="把 /predict 的 prompt 列表按该大小拆成多次 HTTP 调用（本地默认 384，对齐 README 中推荐的 BATCH_SIZE）。",
     )
     p.add_argument("--no_start_server", action="store_true", help="不启动本地 uvicorn，只对已有服务发请求")
     p.add_argument("--details_out", type=str, default=os.path.join("out", "eval_details_official_x3.json"))

@@ -29,7 +29,8 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-4B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+# 默认 384，与本地评测脚本和 README 中推荐参数保持一致（可通过环境变量 BATCH_SIZE 覆盖）。
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
 MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "1024"))
 # 每条最多生成多少新 token（对齐 run_inference_eval.py 默认）
@@ -42,13 +43,15 @@ PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 _load_lock = Lock()
 _llm: LLM | None = None
 _sampling_params: SamplingParams | None = None
+# 标记模型是否已经成功加载（包括轻量 warmup）；用于健康检查与评测脚本的状态判断。
+_model_ready: bool = False
 
 
 def ensure_model_loaded() -> None:
     """
     延迟加载模型，避免容器启动（健康检查阶段）因为加载权重过慢/失败而直接判 Runtime Failed。
     """
-    global _llm, _sampling_params
+    global _llm, _sampling_params, _model_ready
     if _llm is not None and _sampling_params is not None:
         return
 
@@ -76,9 +79,10 @@ def ensure_model_loaded() -> None:
         # - gpu_memory_utilization：略微保守，避免把显存吃满导致 OOM。
         default_max_len = MAX_INPUT_LENGTH + MAX_NEW_TOKENS + 512
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
-        # 默认把并发序列数限制得比较小，避免 vLLM 在 16GB 级别显卡上 warmup 采样器时直接 OOM
-        max_num_seqs = int(os.getenv("VLLM_MAX_NUM_SEQS", "8"))
-        gpu_mem_util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.5"))
+        # 默认把并发序列数和显存利用率设置得较高，以匹配 32GB 级 GPU 的本地评测需求；
+        # 如需在小卡上运行，可通过环境变量 VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL 进行下调。
+        max_num_seqs = int(os.getenv("VLLM_MAX_NUM_SEQS", "384"))
+        gpu_mem_util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.9"))
 
         _llm = LLM(
             model=LOCAL_MODEL_PATH,
@@ -133,6 +137,10 @@ def ensure_model_loaded() -> None:
             except Exception as e:
                 # 预热失败不应影响正常推理；后续首个真实请求仍会完成初始化。
                 print(f"Warmup generate failed (ignored): {type(e).__name__}: {e}")
+
+        # 若执行到此处，视为模型加载流程已完成（即便 warmup 被显式关闭或失败）；
+        # 用于 health_check 与评测脚本判断服务是否 ready。
+        _model_ready = True
 
 
 def build_prompt(question: str) -> str:
@@ -244,7 +252,24 @@ def predict(request: PromptRequest) -> PredictResponse:
 def health_check():
     """
     健康检查端点：
-    - 返回 {\"status\": \"batch\"} 时，评测系统会采用 batch 模式：
+    - 返回 {"status": "batch"} 时，评测系统会采用 batch 模式：
       一次性将全部评测问题通过 /predict 的 prompts 字段发送过来。
+
+    评测系统在 docker run - health check 阶段预留了 420s，
+    这里选择在 **首次健康检查时就阻塞直到模型加载与预热完成**：
+    - 确保 /predict 阶段的时间主要用于真正推理，不被冷启动拖慢；
+    - 避免还没 ready 就通过健康检查，导致正式评测首个请求非常慢。
+
+    如需在本地开发时跳过这一行为，可设置环境变量：
+    - HEALTHCHECK_SKIP_MODEL=1
     """
+    skip_model = os.getenv("HEALTHCHECK_SKIP_MODEL", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not skip_model:
+        # 阻塞直到模型加载 + 轻量 warmup 完成；若失败，抛出的异常会让健康检查返回 500。
+        ensure_model_loaded()
     return {"status": "batch"}

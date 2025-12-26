@@ -16,7 +16,7 @@
 
 您需要关注的核心文件是 `serve.py`。
 
-目前，它使用 `transformers` 库加载了模型 `Qwen/Qwen2.5-0.5B`。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的'/predict'和'/'等端点即可。
+目前，它在 `serve.py` 中通过 `vllm` 加载本地模型目录 `/app/Qwen3-4B`（构建阶段由 `download_model.py` 下载）。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的 `/predict` 和 `/` 等端点即可。
 
 
 **重要**: 评测系统会向 `/predict` 端点发送 `POST` 请求，其JSON body格式为：
@@ -68,7 +68,7 @@ GPU: RTX5090(显存：32GB)
 网络带宽：100Mbps，这个网络延迟的波动性比较大，所以给build阶段预留了25分钟的时间
 ```
 
-judge系统的配置如下：
+judge系统的配置如下（health check 阶段会反复访问 `/`，最长等待 420s，用于完成模型加载 + 预热）：
 
 ``` text
 docker build stage: 1500s
@@ -122,7 +122,7 @@ sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 在项目根目录执行（**本地推荐使用宿主机网络进行构建**）：
 
 ```bash
-# 本地/自有机器（推荐）：使用宿主机网络 + 自定义 pip 源
+# 本地/自有机器（推荐）：使用宿主机网络 + 自定义 pip 源（示例使用官方 PyPI）
 sudo docker build --network host \
   -t paratera-demo:latest . \
   --build-arg PIP_INDEX_URL=https://pypi.org/simple
@@ -187,28 +187,57 @@ sudo docker run --rm -p 8000:8000 paratera-demo:latest
 - GPU 运行（推荐参数）：
 
 ```bash
-sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -p 8000:8000 paratera-demo:latest
+sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -p 8000:8000 \
+  paratera-demo:latest
 ```
+
+- GPU 运行（**带并行度 & 显存利用率调优，适合 32GB 级 GPU 本地评测**）：
+
+```bash
+sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -e PROMPT_STYLE=chatml_lora \
+  -e BATCH_SIZE=384 \
+  -e MAX_INPUT_LENGTH=1024 \
+  -e MAX_NEW_TOKENS=200 \
+  -e VLLM_MAX_NUM_SEQS=384 \
+  -e VLLM_GPU_MEM_UTIL=0.9 \
+  -p 8000:8000 \
+  paratera-demo:latest
+```
+
+> 说明：
+> - 在 `serve.py` 中，`BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 的**代码默认值**已经分别设为 `384 / 384 / 0.9`，即使不传这些环境变量也会采用这一套高并行配置。
+> - 若在小显存 GPU 上运行，可通过环境变量下调这些值（例如 `BATCH_SIZE=64, VLLM_MAX_NUM_SEQS=64, VLLM_GPU_MEM_UTIL=0.6`）以避免 OOM。
+> - 如需关闭服务内部的轻量 warmup（首次加载时会做一次小 batch 的预热），可额外设置 `-e VLLM_DISABLE_WARMUP=1`。
 
 ## 评测平台（judge）等价运行指令（默认端口 8000）
 
 评测平台会先对 `GET /` 做健康检查，然后用 `POST /predict` 做推理。
+
+本模板中 `/` 的行为为：
+- **默认**：在第一次健康检查时阻塞调用 `ensure_model_loaded()`，即等待模型加载与轻量 warmup 完成后再返回 `{"status": "batch"}`，并在内部将 `_model_ready=True`。
+- 这样可以充分利用 `docker run - health check stage: 420s` 这段时间，在真正的 `predict` 阶段避免冷启动开销。
+- `eval_official_http.py` 中的 `wait_server_ready` 会反复轮询 `/`，只有在 `status` 字段为 `"batch"` / `"ok"` 时才开始计时评测，从而保证 tokens/s 只统计模型就绪后的推理速度。
+- 本地开发若希望健康检查“秒回”，可在 `docker run` 时加上 `-e HEALTHCHECK_SKIP_MODEL=1`，此时 `/` 不再阻塞加载模型。
 
 建议用下面这条命令本地“等价模拟评测运行”（默认端口 **8000**）：
 
 ```bash
 sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
   -e PROMPT_STYLE=chatml_lora \
-  -e BATCH_SIZE=4 \
+  -e BATCH_SIZE=384 \
   -e MAX_INPUT_LENGTH=1024 \
   -e MAX_NEW_TOKENS=200 \
+  -e VLLM_MAX_NUM_SEQS=384 \
+  -e VLLM_GPU_MEM_UTIL=0.9 \
   -p 8000:8000 \
   paratera-demo:latest
 ```
 
 > 说明：
 > - `PROMPT_STYLE` 默认就是 `chatml_lora`，这里显式写出便于确认与评测脚本一致。
-> - `BATCH_SIZE` 建议先从 `4` 开始（对齐本地评测脚本默认），避免一次性 batch 过大导致显存 OOM。
+> - `BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 可根据显存和稳定性适当调整；如遇 OOM，可先减小 `BATCH_SIZE` 和 `VLLM_MAX_NUM_SEQS`。
 
 ### 5) 接口验证（符合评测契约）
 
@@ -239,18 +268,46 @@ curl -s -X POST "http://127.0.0.1:8000/predict" \
 仓库内提供 `eval_official_http.py`，会解析 `official_test.txt`，复制多遍后以 batch 方式调用 `/predict`，
 并计算 **ROUGE-L(F1)** 与 **tokens/s**（tokens/s 需要本地可见的模型目录用于 tokenizer 统计）。
 
-示例（服务已在本机 `8000` 端口运行）：
+### 5.1 准备本地 Python 环境（venv）
 
 ```bash
-conda activate gpu_llm
-python eval_official_http.py \
-  --no_start_server \
-  --server_url http://127.0.0.1:8000 \
-  --repeat 1 \
-  --model_path /home/sldrmk/WorkSpace/GPU_LLM/out/Qwen3-4B-realistic-bnb4bit-final
+cd paratera-demo
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 安装评测脚本所需依赖（示例使用官方 PyPI，也可换成其他镜像）
+python -m pip install -i https://pypi.org/simple \
+  jieba rouge-score transformers==4.57.3
 ```
 
-如果推理时出现 500/显存 OOM，可把 HTTP 请求也再拆小一点：
+### 5.2 确保服务已在本机 8000 端口运行
+
+可参考前文的 GPU 运行命令（“带并行度 & 显存利用率调优” 那一条，即 `BATCH_SIZE=384, VLLM_MAX_NUM_SEQS=384, VLLM_GPU_MEM_UTIL=0.9`），保持评测脚本与服务端配置一致。
+
+### 5.3 导出模型目录到宿主机并运行评测
+
+首先从镜像中导出模型（仅需执行一次）：
+
+```bash
+cd paratera-demo
+mkdir -p ~/data/models
+cid=$(docker create paratera-demo:latest)
+docker cp "$cid":/app/Qwen3-4B ~/data/models/Qwen3-4B
+docker rm "$cid"
+```
+
+然后在 venv 中运行评测脚本（默认会使用 `official_test_358.txt` + `request_chunk_size=384`，与服务端 `BATCH_SIZE=384` 对齐）：
+
+```bash
+cd paratera-demo
+source .venv/bin/activate
+
+python eval_official_http.py \
+  --no_start_server \
+  --server_url http://127.0.0.1:8000
+```
+
+如果推理时出现 500/显存 OOM，可把 HTTP 请求也再拆小一点，例如：
 
 ```bash
 python eval_official_http.py \
@@ -258,7 +315,7 @@ python eval_official_http.py \
   --server_url http://127.0.0.1:8000 \
   --repeat 3 \
   --request_chunk_size 4 \
-  --model_path /home/sldrmk/WorkSpace/GPU_LLM/out/Qwen3-4B-realistic-bnb4bit-final
+  --model_path ~/data/models/Qwen3-4B
 ```
 
 ### 6) 模型文件位置
