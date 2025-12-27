@@ -287,7 +287,9 @@ def main():
     p.add_argument(
         "--model_path",
         type=str,
-        default=os.getenv("LOCAL_MODEL_PATH", os.path.expanduser("~/data/models/Qwen3-4B")),
+        default=os.getenv(
+            "LOCAL_MODEL_PATH", os.path.expanduser("~/data/models/Qwen3-4B")
+        ),
         help="用于本地统计 tokens/s 的模型目录（需为宿主机可见的本地路径）。",
     )
     p.add_argument("--timeout", type=float, default=360.0)
@@ -297,8 +299,73 @@ def main():
         default=384,
         help="把 /predict 的 prompt 列表按该大小拆成多次 HTTP 调用（本地默认 384，对齐 README 中推荐的 BATCH_SIZE）。",
     )
+
+    # ------ 关键 batch / vLLM 参数暴露为命令行选项，方便本地扫点做蒸馏实验 ------
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=int(os.getenv("BATCH_SIZE", "384")),
+        help="服务端一次最大处理的样本条数（会通过环境变量 BATCH_SIZE 传给 serve.py）。",
+    )
+    p.add_argument(
+        "--max_input_length",
+        type=int,
+        default=int(os.getenv("MAX_INPUT_LENGTH", "1024")),
+        help="prompt 侧最大长度，会通过 MAX_INPUT_LENGTH 传给 serve.py。",
+    )
+    p.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=int(os.getenv("MAX_NEW_TOKENS", "256")),
+        help="每条样本生成的新 token 上限，会通过 MAX_NEW_TOKENS 传给 serve.py。",
+    )
+    p.add_argument(
+        "--vllm_tp_size",
+        type=int,
+        default=int(os.getenv("VLLM_TP_SIZE", "1")),
+        help="vLLM tensor_parallel_size，单卡 5090 一般保持 1 即可。",
+    )
+    p.add_argument(
+        "--vllm_dtype",
+        type=str,
+        default=os.getenv("VLLM_DTYPE", "bfloat16"),
+        help='vLLM dtype，默认为 "bfloat16"（对 5090 友好）。',
+    )
+    p.add_argument(
+        "--vllm_max_model_len",
+        type=int,
+        default=int(os.getenv("VLLM_MAX_MODEL_LEN", "0")),
+        help=(
+            "vLLM 的 max_model_len；0 表示由 serve.py 根据 MAX_INPUT_LENGTH/MAX_NEW_TOKENS 自动推导。"
+        ),
+    )
+    p.add_argument(
+        "--vllm_max_num_seqs",
+        type=int,
+        default=int(os.getenv("VLLM_MAX_NUM_SEQS", "384")),
+        help=(
+            "vLLM 的 max_num_seqs；0 表示使用 serve.py 的显存自适应默认值（24GB+ 卡上更激进）。"
+        ),
+    )
+    p.add_argument(
+        "--vllm_gpu_mem_util",
+        type=float,
+        default=float(os.getenv("VLLM_GPU_MEM_UTIL", "0.9")),
+        help="vLLM 的 gpu_memory_utilization；0 表示使用 serve.py 的默认策略。",
+    )
+    p.add_argument(
+        "--vllm_disable_warmup",
+        action="store_true",
+        help=(
+            "设置后通过环境变量 VLLM_DISABLE_WARMUP=1 关闭 serve.py 里的轻量 warmup，可避免一次性的预热开销。"
+        ),
+    )
     p.add_argument("--no_start_server", action="store_true", help="不启动本地 uvicorn，只对已有服务发请求")
-    p.add_argument("--details_out", type=str, default=os.path.join("out", "eval_details_official_x3.json"))
+    p.add_argument(
+        "--details_out",
+        type=str,
+        default=os.path.join("out", "eval_details_official_x3.json"),
+    )
     args = p.parse_args()
 
     server_url = args.server_url.strip() or f"http://{args.host}:{args.port}"
@@ -311,10 +378,27 @@ def main():
         env = os.environ.copy()
         # 确保本脚本的设置能传给服务（例如 LOCAL_MODEL_PATH/BATCH_SIZE/MAX_*）
         env.setdefault("LOCAL_MODEL_PATH", args.model_path)
+
+        # ------ 将关键 batch / vLLM 参数通过环境变量传给 serve.py ------
+        env["BATCH_SIZE"] = str(args.batch_size)
+        env["MAX_INPUT_LENGTH"] = str(args.max_input_length)
+        env["MAX_NEW_TOKENS"] = str(args.max_new_tokens)
+        env["VLLM_TP_SIZE"] = str(args.vllm_tp_size)
+        env["VLLM_DTYPE"] = args.vllm_dtype
+
+        if args.vllm_max_model_len > 0:
+            env["VLLM_MAX_MODEL_LEN"] = str(args.vllm_max_model_len)
+        if args.vllm_max_num_seqs > 0:
+            env["VLLM_MAX_NUM_SEQS"] = str(args.vllm_max_num_seqs)
+        if args.vllm_gpu_mem_util > 0:
+            env["VLLM_GPU_MEM_UTIL"] = str(args.vllm_gpu_mem_util)
+        if args.vllm_disable_warmup:
+            env["VLLM_DISABLE_WARMUP"] = "1"
+
         proc = start_server_subprocess(args.workdir, args.host, args.port, env=env)
 
     try:
-        wait_server_ready(server_url, timeout_s=120.0)
+        wait_server_ready(server_url, timeout_s=args.timeout)
         r = run_eval(
             server_url=server_url,
             qa_pairs=qa_pairs,

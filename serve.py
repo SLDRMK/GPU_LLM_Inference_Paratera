@@ -34,7 +34,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
 MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "1024"))
 # 每条最多生成多少新 token（对齐 run_inference_eval.py 默认）
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 # Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
 # - medical_qa: Q: ...\nA:
 # - chatml_lora: ChatML system/user/assistant
@@ -73,16 +73,43 @@ def ensure_model_loaded() -> None:
         # 返回结果本身只包含“新生成部分”，无需再手动裁剪 prompt。
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
         dtype = os.getenv("VLLM_DTYPE", "bfloat16")
+
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
-        # - max_num_seqs：默认可能是 256，这会导致 vLLM warmup 阶段用 256 条 dummy 请求占满显存，这里改为 32。
-        # - gpu_memory_utilization：略微保守，避免把显存吃满导致 OOM。
         default_max_len = MAX_INPUT_LENGTH + MAX_NEW_TOKENS + 512
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
-        # 默认把并发序列数和显存利用率设置得较高，以匹配 32GB 级 GPU 的本地评测需求；
-        # 如需在小卡上运行，可通过环境变量 VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL 进行下调。
-        max_num_seqs = int(os.getenv("VLLM_MAX_NUM_SEQS", "384"))
-        gpu_mem_util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.9"))
+
+        # 针对不同显存容量的 GPU，自适应调节 vLLM 的并发与显存占用：
+        # - 16GB 左右：保持相对保守（max_num_seqs≈BATCH_SIZE，gpu_memory_util≈0.9）
+        # - 24GB 及以上（典型如 RTX 5090）：适当提高并发和显存占用（max_num_seqs 提升到 512，gpu_memory_util≈0.95）
+        # 以上只是默认策略，均可通过环境变量 VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL 显式覆盖。
+        default_max_num_seqs = max(BATCH_SIZE, 384)
+        default_gpu_mem_util = 0.92
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                total_gb = props.total_memory / (1024**3)
+                # 22GB 做一个大致分界：包括 24GB 等中高端卡
+                if total_gb >= 22:
+                    # 24GB 级别：在保证相对安全的前提下提高并发与显存利用率
+                    default_max_num_seqs = max(BATCH_SIZE, 512)
+                    default_gpu_mem_util = 0.92
+                # 30GB+（如 32GB 5090）：可以进一步加大并发与显存占用来榨干吞吐
+                if total_gb >= 30:
+                    default_max_num_seqs = max(BATCH_SIZE, 768)
+                    default_gpu_mem_util = 0.93
+        except Exception:
+            # torch 不可用或查询失败时退回到保守默认值
+            pass
+
+        max_num_seqs = int(
+            os.getenv("VLLM_MAX_NUM_SEQS", str(default_max_num_seqs))
+        )
+        gpu_mem_util = float(
+            os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
+        )
 
         _llm = LLM(
             model=LOCAL_MODEL_PATH,
