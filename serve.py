@@ -73,6 +73,11 @@ def ensure_model_loaded() -> None:
         # 返回结果本身只包含“新生成部分”，无需再手动裁剪 prompt。
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
         dtype = os.getenv("VLLM_DTYPE", "bfloat16")
+        # vLLM 量化方式（例如 "bitsandbytes" / "awq" / "gptq" 等）：
+        # - 默认值直接采用 "bitsandbytes"：与本项目的 bnb4bit 量化权重对齐，
+        #   这样在 Docker / 评测平台上无需额外设置环境变量也会按 bnb4bit 路径加载。
+        # - 若需关闭 vLLM 量化，可在运行时显式设置 VLLM_QUANTIZATION 为空字符串。
+        quantization = os.getenv("VLLM_QUANTIZATION", "bitsandbytes").strip().lower() or None
 
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
@@ -80,11 +85,10 @@ def ensure_model_loaded() -> None:
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
 
         # 针对不同显存容量的 GPU，自适应调节 vLLM 的并发与显存占用：
-        # - 16GB 左右：保持相对保守（max_num_seqs≈BATCH_SIZE，gpu_memory_util≈0.9）
-        # - 24GB 及以上（典型如 RTX 5090）：适当提高并发和显存占用（max_num_seqs 提升到 512，gpu_memory_util≈0.95）
-        # 以上只是默认策略，均可通过环境变量 VLLM_MAX_NUM_SEQS / VLLM_GPU_MEM_UTIL 显式覆盖。
+        # - 这里将默认 gpu_memory_util 固定为 0.9（与 README / Docker 示例保持一致），
+        #   如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
         default_max_num_seqs = max(BATCH_SIZE, 384)
-        default_gpu_mem_util = 0.92
+        default_gpu_mem_util = 0.9
         try:
             import torch  # type: ignore
 
@@ -93,13 +97,11 @@ def ensure_model_loaded() -> None:
                 total_gb = props.total_memory / (1024**3)
                 # 22GB 做一个大致分界：包括 24GB 等中高端卡
                 if total_gb >= 22:
-                    # 24GB 级别：在保证相对安全的前提下提高并发与显存利用率
+                    # 24GB 级别：保持较高并发，显存利用率仍默认 0.9
                     default_max_num_seqs = max(BATCH_SIZE, 512)
-                    default_gpu_mem_util = 0.92
                 # 30GB+（如 32GB 5090）：可以进一步加大并发与显存占用来榨干吞吐
                 if total_gb >= 30:
                     default_max_num_seqs = max(BATCH_SIZE, 768)
-                    default_gpu_mem_util = 0.93
         except Exception:
             # torch 不可用或查询失败时退回到保守默认值
             pass
@@ -111,7 +113,7 @@ def ensure_model_loaded() -> None:
             os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
         )
 
-        _llm = LLM(
+        llm_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
             trust_remote_code=True,
@@ -121,6 +123,13 @@ def ensure_model_loaded() -> None:
             max_num_seqs=max_num_seqs,
             gpu_memory_utilization=gpu_mem_util,
         )
+        # 仅当显式设置了 VLLM_QUANTIZATION 时，才把 quantization 传给 vLLM：
+        # - 例如：VLLM_QUANTIZATION=bitsandbytes / awq / gptq
+        # - 不设置则保持与原始行为一致，避免影响未量化模型。
+        if quantization is not None:
+            llm_kwargs["quantization"] = quantization
+
+        _llm = LLM(**llm_kwargs)
 
         stop_tokens = None
         if PROMPT_STYLE == "chatml_lora":
