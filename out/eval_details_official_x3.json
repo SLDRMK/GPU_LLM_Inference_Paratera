@@ -284,7 +284,7 @@
   {
     "question": "GPU架构的warp调度器如何选择就绪warp执行？",
     "reference": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
-    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已获取数据的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
+    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
     "rougeL_f1": 1.0
   },
   {
@@ -836,7 +836,7 @@
   {
     "question": "GPU架构的warp调度器如何选择就绪warp执行？",
     "reference": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
-    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已获取数据的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
+    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
     "rougeL_f1": 1.0
   },
   {
@@ -1100,8 +1100,8 @@
   {
     "question": "如何用TileLang实现ConvNets的深度卷积（Depthwise Convolution），优化组内内存局部性？",
     "reference": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑，TileLang自动优化组内数据的共享内存存储。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim=1, size=1)\n    for c in 0..in_channels-1 {\n        @tile(size=16, dim=2)\n        for row in 0..height-1 {\n            @tile(size=16, dim=3)\n            for col in 0..width-1 {\n                let y_val: Float32 = 0.0;\n                for k in 0..kernel_size-1 {\n                    for l in 0..kernel_size-1 {\n                        let x_row = row + k - kernel_size//2;\n                        let x_col = col + l - kernel_size//2;\n                        let x_val = x.data[batch][c][x_row][x_col] if (x_row >=0 && x_row < height && x_col >=0 && x_col < width) else 0.0;\n                        let w_val = w.data[c][0][k][l];\n                        y_val += x_val * w_val;\n                    }\n                }\n                y.data[batch][c][row][col] = y_val;\n            }\n        }\n    }\n    return y;\n}\nTileLang的通道分组优化让组内数据集中存储，减少共享内存访问冲突，提升组内数据复用率，深度卷积性能比普通卷积提升2-3倍，适合移动设备和边缘计算场景。",
-    "prediction": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑，TileLang自动优化组内数据的共享内存存储。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim",
-    "rougeL_f1": 0.4810126582278481
+    "prediction": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑（@tile指定输入和输出tile大小）。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim=1,",
+    "rougeL_f1": 0.47698744769874485
   },
   {
     "question": "CUDA中矩阵乘法算子如何利用共享内存减少全局内存访问？",
@@ -1568,8 +1568,8 @@
   {
     "question": "卷积算子的算法如何通过“多尺度分块”优化，CUDA编程如何实现？",
     "reference": "算法上，根据输入尺寸和掩码大小动态调整分块尺度（如小输入用小TILE_SIZE，大输入用大TILE_SIZE），平衡并行度和内存复用；CUDA编程中，通过主机端计算不同尺度的TILE_SIZE，传递给内核作为参数，核心代码：\nint TILE_SIZE = (width < 256) ? 16 : 32;\nconv_kernel<<<gridDim, dim3(TILE_SIZE, TILE_SIZE)>>>(d_X, d_W, d_Y, width, height, TILE_SIZE);\n内核中根据TILE_SIZE调整共享内存数组大小（如__shared__ float X_ds[TILE_SIZE + MAX_MASK_WIDTH - 1][TILE_SIZE + MAX_MASK_WIDTH - 1]），适配不同输入尺度。",
-    "prediction": "算法上，根据输入尺寸和掩码大小动态调整分块尺度（如小输入用小TILE_SIZE，大输入用大TILE_SIZE），平衡并行度和内存复用；CUDA编程中，通过主机端计算不同尺度的TILE_SIZE，传递给内核作为参数，核心代码：\nint TILE_SIZE = (width < 256) ? 16 : 32;\nconv_kernel<<<gridDim, dim3(TILE_SIZE, TILE_SIZE)>>>(d_X, d_W, d_Y, width, height, TILE_SIZE);\n内核中根据TILE_SIZE调整共享内存数组大小（如__shared__ float X_ds[TILE_SIZE + MAX_MASK_WIDTH - 1][TILE_SIZE + MAX_MASK_WIDTH - 1]），适配不同输入尺度。",
-    "rougeL_f1": 1.0
+    "prediction": "算法上，根据输入尺寸和掩码大小动态调整分块尺度（如小输入用小TILE_SIZE，大输入用大TILE_SIZE），平衡并行度和内存复用；CUDA编程中，通过主机端计算不同尺度的TILE_SIZE，传递给内核作为参数，核心代码：\nint TILE_SIZE = (width < 256) ? 16 : 32;\nconv_kernel<<<gridDim, dim3(TILE_SIZE, TILE_SIZE)>>>(d_X, d_W, d_Y, X_strides, Y_strides, width, height, TILE_SIZE);\n内核中根据TILE_SIZE调整共享内存数组大小（如__shared__ float X_ds[TILE_SIZE + MAX_MASK_WIDTH - 1][TILE_SIZE + MAX_MASK_WIDTH - 1]），适配不同输入尺度。",
+    "rougeL_f1": 0.9615384615384615
   },
   {
     "question": "SpMV算子的算法如何通过“原子操作优化”处理输出向量的累加，CUDA编程如何实现？",
@@ -1634,8 +1634,8 @@
   {
     "question": "Triton实现的ConvNets反向传播算子，如何利用自动微分和内存复用提升性能？",
     "reference": "Triton结合PyTorch的自动微分框架，可自动生成梯度计算内核，同时通过内存复用减少中间数据存储。实现步骤：1. 用Triton定义前向卷积内核；2. 借助PyTorch的torch.autograd.Function封装前向和反向传播；3. 反向传播中复用前向的输入和权重分块缓存，避免重复加载。核心代码片段：\nclass TritonConv2d(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, x, w):\n        # 前向传播，调用Triton卷积内核\n        y = triton_conv2d_forward(x, w)\n        # 保存中间数据用于反向传播\n        ctx.save_for_backward(x, w)\n        return y\n    @staticmethod\n    def backward(ctx, grad_y):\n        x, w = ctx.saved_tensors\n        # 反向传播，调用Triton梯度内核，复用前向分块缓存\n        grad_x = triton_conv2d_backward_input(x, w, grad_y)\n        grad_w = triton_conv2d_backward_weight(x, w, grad_y)\n        return grad_x, grad_w\n自动微分调用\nx = torch.randn(1, 3, 256, 256).cuda()\nw = torch.randn(64, 3, 3, 3).cuda()\nconv = TritonConv2d.apply\ny = conv(x, w)\ny.sum().backward()\nTriton的自动微分支持减少手动编写梯度内核的工作量，内存复用优化减少中间数据的全局内存存储和访问，提升反向传播性能。",
-    "prediction": "Triton结合PyTorch的自动微分框架，可自动生成梯度计算内核，同时通过内存复用减少中间数据存储。实现步骤：1. 用Triton定义前向卷积内核；2. 借助PyTorch的torch.autograd.Function封装前向和反向传播；3. 反向传播中复用前向的输入和权重分块缓存，避免重复加载。核心代码片段：\nclass TritonConv2d(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, x, w):\n        # 前向传播，调用Triton卷积内核\n        y = triton_conv2d_forward(x, w)\n        # 保存中间数据用于反向传播\n        ctx.save_for_backward(x, w)\n        return y\n    @staticmethod\n    def backward(ctx, grad_y):\n        x, w = ctx.save_for_backward()\n        # 反向传播，调用Triton梯度内核，复用前向分块缓存\n        grad_x = triton_conv2d_backward_input(x, w, grad_y)\n        grad_w = triton_conv2d_backward_weight",
-    "rougeL_f1": 0.7515151515151515
+    "prediction": "Triton结合PyTorch的自动微分框架，可自动生成梯度计算内核，同时通过内存复用减少中间数据存储。实现步骤：1. 用Triton定义前向卷积内核；2. 借助PyTorch的torch.autograd.Function封装前向和反向传播；3. 反向传播中复用前向的输入和权重分块缓存，避免重复加载。核心代码片段：\nclass TritonConv2d(torch.autograd.Function):\n    @staticmethod\n    def forward(ctx, x, w):\n        # 前向传播，调用Triton卷积内核\n        y = triton_conv2d_forward(x, w)\n        # 保存中间数据用于反向传播\n        ctx.save_for_backward(x, w)\n        return y\n    @staticmethod\n    def backward(ctx, grad_y):\n        x, w = ctx.saved_tensors\n        # 反向传播，调用Triton梯度内核，复用前向分块缓存\n        grad_x = triton_conv2d_backward_input(x, w, grad_y)\n        grad_w = triton_conv2d_backward_weight(x",
+    "rougeL_f1": 0.787878787878788
   },
   {
     "question": "如何用TileLang优化稀疏矩阵转置后的SpMV算子，利用转置后的连续访问模式？",
@@ -1652,8 +1652,8 @@
   {
     "question": "如何用TileLang实现ConvNets的深度卷积（Depthwise Convolution），优化组内内存局部性？",
     "reference": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑，TileLang自动优化组内数据的共享内存存储。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim=1, size=1)\n    for c in 0..in_channels-1 {\n        @tile(size=16, dim=2)\n        for row in 0..height-1 {\n            @tile(size=16, dim=3)\n            for col in 0..width-1 {\n                let y_val: Float32 = 0.0;\n                for k in 0..kernel_size-1 {\n                    for l in 0..kernel_size-1 {\n                        let x_row = row + k - kernel_size//2;\n                        let x_col = col + l - kernel_size//2;\n                        let x_val = x.data[batch][c][x_row][x_col] if (x_row >=0 && x_row < height && x_col >=0 && x_col < width) else 0.0;\n                        let w_val = w.data[c][0][k][l];\n                        y_val += x_val * w_val;\n                    }\n                }\n                y.data[batch][c][row][col] = y_val;\n            }\n        }\n    }\n    return y;\n}\nTileLang的通道分组优化让组内数据集中存储，减少共享内存访问冲突，提升组内数据复用率，深度卷积性能比普通卷积提升2-3倍，适合移动设备和边缘计算场景。",
-    "prediction": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑（@tile指定输入和输出tile大小）。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim=1,",
-    "rougeL_f1": 0.47698744769874485
+    "prediction": "深度卷积将输入通道与输出通道一一对应，组内卷积独立计算，TileLang通过@group注解指定通道分组，优化组内数据复用。实现步骤：1. 定义输入（多通道）、深度卷积核（单通道输入、单通道输出）；2. 用@group按通道分组（每组1个输入通道、1个输出通道）；3. 编写组内卷积逻辑，TileLang自动优化组内数据的共享内存存储。核心代码：\n// TileLang代码\n@tile\ndef depthwise_conv(x: Tensor4D<Float32>, w: Tensor4D<Float32>, kernel_size: Int32) -> Tensor4D<Float32> {\n    let (batch, in_channels, height, width) = x.shape;\n    let (out_channels, _, _, _) = w.shape;\n    assert(in_channels == out_channels); // 深度卷积通道数一致\n    let y: Tensor4D<Float32> = zeros((batch, out_channels, height, width));\n    // 按通道分组，每组1个输入+1个输出通道\n    @group(dim",
+    "rougeL_f1": 0.4810126582278481
   },
   {
     "question": "CUDA中矩阵乘法算子如何利用共享内存减少全局内存访问？",
@@ -1916,7 +1916,7 @@
   {
     "question": "CUDA中SpMV算子如何处理空行（无非零元素的矩阵行）？",
     "reference": "通过csrRowPtr数组判断行是否为空（if (csrRowPtr[row+1] == csrRowPtr[row])），若为空则线程跳过该行列的计算，直接输出0或不更新结果，避免无效的内存访问和计算，提升算子效率。",
-    "prediction": "通过csrRowPtr数组判断行是否为空（if (csrRowPtr[row+1] == csrRowPtr[row])），若为空则跳过该行列的计算，直接输出0或不更新结果，避免无效的内存访问和计算，提升算子效率。",
+    "prediction": "通过csrRowPtr数组判断行是否为空（if (csrRowPtr[row+1] == csrRowPtr[row])），若为空则线程跳过该行列的计算，直接输出0或不更新结果，避免无效的内存访问和计算，提升算子效率。",
     "rougeL_f1": 1.0
   },
   {
@@ -1940,7 +1940,7 @@
   {
     "question": "GPU架构的warp调度器如何选择就绪warp执行？",
     "reference": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
-    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已获取数据的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
+    "prediction": "warp调度器优先选择无数据依赖、已获取所需数据的warp执行。矩阵乘法算子中，当一个warp等待共享内存加载时，调度器会选择其他已加载完成的warp执行计算，最大化SM的计算资源利用率，隐藏内存延迟。",
     "rougeL_f1": 1.0
   },
   {

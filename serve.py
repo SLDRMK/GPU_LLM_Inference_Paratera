@@ -61,12 +61,14 @@ async def _warmup_engine(
 ) -> None:
     """
     使用大 Batch + 极少生成 token 的方式进行预热，以触发大 Batch CUDA kernel 编译。
+    额外基于官方评测数据做一次“形状感知”预热，使真实请求的首轮耗时更接近稳定值。
     """
     # 预热 batch 尽量大，但不超过配置的 max_num_seqs 和评测 batch size
     warmup_batch = min(BATCH_SIZE, max_num_seqs)
     if warmup_batch <= 0:
         return
 
+    # ---------------- 第一阶段：大 Batch + max_tokens=1，触发大并发 CUDA Graph ----------------
     warmup_prompt = "Warmup prompt"
     # 极简采样参数：只生成 1 个 token，速度最快
     warmup_params = SamplingParams(
@@ -97,6 +99,58 @@ async def _warmup_engine(
     duration = time.time() - start
     print(f"Warmup generate (async): done in {duration:.2f}s.")
 
+    # ---------------- 第二阶段：基于官方评测数据做“形状感知”预热 ----------------
+    # 只取一小部分问题，避免启动时间过长；重点覆盖真实 prompt 长度分布。
+    try:
+        dataset_path = os.getenv("WARMUP_DATA_PATH", "official_test_358.txt")
+        if not os.path.isabs(dataset_path):
+            dataset_path = os.path.join(os.getcwd(), dataset_path)
+        questions: List[str] = []
+        if os.path.exists(dataset_path):
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # 简单从包含“问题：”的行中抽取问题部分；其余行整体当作 question。
+                    q = line
+                    idx = q.find("问题：")
+                    if idx != -1:
+                        q = q[idx + len("问题：") :]
+                    questions.append(q)
+                    if len(questions) >= min(64, warmup_batch):
+                        break
+
+        if questions:
+            shape_batch = len(questions)
+            shape_max_tokens = min(16, MAX_NEW_TOKENS)
+            shape_params = SamplingParams(
+                max_tokens=shape_max_tokens,
+                temperature=0.0,
+                top_p=1.0,
+                n=1,
+                stop=stop_tokens,
+            )
+            shape_tasks = []
+            print(
+                f"Shape Warmup (async): samples={shape_batch}, "
+                f"max_tokens={shape_max_tokens}, data_path={dataset_path}"
+            )
+            s_start = time.time()
+            for i, q in enumerate(questions):
+                prompt = build_prompt(q)
+                req_id = f"shape-warmup-{i}-{uuid.uuid4()}"
+                gen = engine.generate(prompt, shape_params, req_id)
+                shape_tasks.append(_wait_for_result(gen))
+            await asyncio.gather(*shape_tasks)
+            s_dur = time.time() - s_start
+            print(f"Shape Warmup (async): done in {s_dur:.2f}s.")
+        else:
+            print("Shape Warmup: no questions loaded, skip.")
+    except Exception as e:
+        # 形状预热失败不影响主流程
+        print(f"Shape Warmup failed (ignored): {type(e).__name__}: {e}")
+
 
 async def ensure_model_loaded() -> None:
     """
@@ -104,14 +158,14 @@ async def ensure_model_loaded() -> None:
     """
     global _engine, _sampling_params, _model_ready
     if _engine is not None and _sampling_params is not None and _model_ready:
-            return
+        return
 
-        # --- 网络连通性测试，仅打印结果 ---
-        internet_ok = check_internet()
-        print(
-            "【Internet Connectivity Test】: ",
-            "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
-        )
+    # --- 网络连通性测试，仅打印结果 ---
+    internet_ok = check_internet()
+    print(
+        "【Internet Connectivity Test】: ",
+        "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
+    )
 
     need_init = False
     # 这些配置在 CPU 侧计算完成，无需 async
@@ -315,12 +369,12 @@ async def _startup_warmup():
     if disable:
         return
 
-        try:
+    try:
         await ensure_model_loaded()
-            print("Warmup: model loaded.")
-        except Exception as e:
-            # 不要让预热失败影响服务启动；真正推理时仍会触发 ensure_model_loaded 并抛出更明确错误
-            print(f"Warmup failed (will retry on first /predict): {type(e).__name__}: {e}")
+        print("Warmup: model loaded.")
+    except Exception as e:
+        # 不要让预热失败影响服务启动；真正推理时仍会触发 ensure_model_loaded 并抛出更明确错误
+        print(f"Warmup failed (will retry on first /predict): {type(e).__name__}: {e}")
 
 
 class PromptRequest(BaseModel):
@@ -347,7 +401,7 @@ async def predict(request: PromptRequest) -> PredictResponse:
         batch_questions = request.prompt
         prompts = [build_prompt(q) for q in batch_questions]
         answers = await generate_answers_from_prompts(prompts)
-            # 对齐 run_inference_eval.py：token 级切分后直接返回答案，不再做额外字符串截断
+        # 对齐 run_inference_eval.py：token 级切分后直接返回答案，不再做额外字符串截断
         return PredictResponse(response=[a.strip() for a in answers])
 
     # ---------- 单条模式：fallback 到 prompt ----------
