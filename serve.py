@@ -1,16 +1,22 @@
 import os
 import socket
-from threading import Lock, Thread
+import uuid
+import asyncio
+import time
+import json
+from threading import Lock
 from typing import List, Union
 
 from fastapi import FastAPI
 from pydantic import BaseModel
-from vllm import LLM, SamplingParams
+from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
+# 优化 CUDA 显存分配，减少碎片与 OOM 概率
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> bool:
@@ -41,22 +47,63 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 
 _load_lock = Lock()
-_llm: LLM | None = None
+_engine: AsyncLLMEngine | None = None
 _sampling_params: SamplingParams | None = None
-# 标记模型是否已经成功加载（包括轻量 warmup）；用于健康检查与评测脚本的状态判断。
+# 标记模型是否已经成功加载（包括 warmup）；用于健康检查与评测脚本的状态判断。
 _model_ready: bool = False
 
 
-def ensure_model_loaded() -> None:
+async def _warmup_engine(
+    engine: AsyncLLMEngine,
+    stop_tokens,
+    max_num_seqs: int,
+    gpu_mem_util: float,
+) -> None:
     """
-    延迟加载模型，避免容器启动（健康检查阶段）因为加载权重过慢/失败而直接判 Runtime Failed。
+    使用大 Batch + 极少生成 token 的方式进行预热，以触发大 Batch CUDA kernel 编译。
     """
-    global _llm, _sampling_params, _model_ready
-    if _llm is not None and _sampling_params is not None:
+    # 预热 batch 尽量大，但不超过配置的 max_num_seqs 和评测 batch size
+    warmup_batch = min(BATCH_SIZE, max_num_seqs)
+    if warmup_batch <= 0:
         return
 
-    with _load_lock:
-        if _llm is not None and _sampling_params is not None:
+    warmup_prompt = "Warmup prompt"
+    # 极简采样参数：只生成 1 个 token，速度最快
+    warmup_params = SamplingParams(
+        max_tokens=1,
+        temperature=0.0,
+        top_p=1.0,
+        n=1,
+        stop=stop_tokens,
+        ignore_eos=True,
+    )
+
+    async def _wait_for_result(gen):
+        async for _ in gen:
+            pass
+
+    tasks = []
+    start = time.time()
+    print(
+        f"Warmup generate (async): batch={warmup_batch}, "
+        f"max_tokens=1, max_num_seqs={max_num_seqs}, gpu_mem_util={gpu_mem_util}"
+    )
+    for i in range(warmup_batch):
+        req_id = f"warmup-{i}-{uuid.uuid4()}"
+        gen = engine.generate(warmup_prompt, warmup_params, req_id)
+        tasks.append(_wait_for_result(gen))
+
+    await asyncio.gather(*tasks)
+    duration = time.time() - start
+    print(f"Warmup generate (async): done in {duration:.2f}s.")
+
+
+async def ensure_model_loaded() -> None:
+    """
+    延迟加载模型，使用 AsyncLLMEngine，并在首次加载时执行大 Batch 预热。
+    """
+    global _engine, _sampling_params, _model_ready
+    if _engine is not None and _sampling_params is not None and _model_ready:
             return
 
         # --- 网络连通性测试，仅打印结果 ---
@@ -66,23 +113,54 @@ def ensure_model_loaded() -> None:
             "CONNECTED" if internet_ok else "OFFLINE / BLOCKED",
         )
 
-        # --- 模型加载（完全本地，无网络）---
-        print(f"从本地加载模型（vLLM）：{LOCAL_MODEL_PATH}")
+    need_init = False
+    # 这些配置在 CPU 侧计算完成，无需 async
+    with _load_lock:
+        if _engine is not None and _sampling_params is not None and _model_ready:
+            return
 
-        # vLLM 会自动处理 tokenizer 和 prompt/token 的对应关系，
-        # 返回结果本身只包含“新生成部分”，无需再手动裁剪 prompt。
+        print(f"从本地加载模型（vLLM Async）：{LOCAL_MODEL_PATH}")
+
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
         dtype = os.getenv("VLLM_DTYPE", "bfloat16")
         # vLLM 量化方式（例如 "bitsandbytes" / "awq" / "gptq" 等）：
-        # - 默认值直接采用 "bitsandbytes"：与本项目的 bnb4bit 量化权重对齐，
-        #   这样在 Docker / 评测平台上无需额外设置环境变量也会按 bnb4bit 路径加载。
-        # - 若需关闭 vLLM 量化，可在运行时显式设置 VLLM_QUANTIZATION 为空字符串。
-        quantization = os.getenv("VLLM_QUANTIZATION", "bitsandbytes").strip().lower() or None
+        # - 默认不启用量化；如需开启，可通过环境变量 VLLM_QUANTIZATION 显式设置。
+        quantization_env = os.getenv("VLLM_QUANTIZATION", "").strip().lower()
+        quantization = quantization_env or None
 
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
         default_max_len = MAX_INPUT_LENGTH + MAX_NEW_TOKENS + 512
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
+
+        # --- 根据本地模型目录自动识别是否为 AWQ 量化模型，用于自动启用 AWQ 加速 ---
+        is_awq_model = False
+        try:
+            qm_path = os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json")
+            cfg_path = os.path.join(LOCAL_MODEL_PATH, "config.json")
+            if os.path.exists(qm_path):
+                with open(qm_path, "r", encoding="utf-8") as f:
+                    qm = json.load(f)
+                q_method = str(qm.get("quant_method", "")).lower()
+                if "awq" in q_method:
+                    is_awq_model = True
+            if not is_awq_model and os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                qcfg = cfg.get("quantization_config") or {}
+                q_method_conf = str(qcfg.get("quant_method", "")).lower()
+                if "awq" in q_method_conf:
+                    is_awq_model = True
+        except Exception as e:
+            # 量化方式检测失败不影响主流程，仅作为自动加速的提示信息
+            print(f"Detect AWQ quantization failed (ignored): {type(e).__name__}: {e}")
+
+        # 若检测到是 AWQ 模型，且用户未通过环境变量覆盖量化方式，则自动启用 AWQ + Marlin 加速
+        if is_awq_model and not quantization_env:
+            # vLLM 日志提示：可使用 awq_marlin 以获得更快推理
+            quantization = "awq_marlin"
+            # AWQ 通常配合 float16 计算更稳定，这里自动切到 float16
+            dtype = "float16"
 
         # 针对不同显存容量的 GPU，自适应调节 vLLM 的并发与显存占用：
         # - 这里将默认 gpu_memory_util 固定为 0.9（与 README / Docker 示例保持一致），
@@ -113,7 +191,7 @@ def ensure_model_loaded() -> None:
             os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
         )
 
-        llm_kwargs = dict(
+        engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
             trust_remote_code=True,
@@ -122,14 +200,18 @@ def ensure_model_loaded() -> None:
             max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
             gpu_memory_utilization=gpu_mem_util,
+            enable_prefix_caching=True,
         )
         # 仅当显式设置了 VLLM_QUANTIZATION 时，才把 quantization 传给 vLLM：
         # - 例如：VLLM_QUANTIZATION=bitsandbytes / awq / gptq
-        # - 不设置则保持与原始行为一致，避免影响未量化模型。
         if quantization is not None:
-            llm_kwargs["quantization"] = quantization
+            engine_kwargs["quantization"] = quantization
+        # AWQ 模型额外开启 fp8 KV cache，以进一步压缩显存、提升吞吐（需 vLLM 版本支持）
+        if is_awq_model:
+            engine_kwargs["kv_cache_dtype"] = "fp8"
 
-        _llm = LLM(**llm_kwargs)
+        engine_args = AsyncEngineArgs(**engine_kwargs)
+        _engine = AsyncLLMEngine.from_engine_args(engine_args)
 
         stop_tokens = None
         if PROMPT_STYLE == "chatml_lora":
@@ -143,9 +225,10 @@ def ensure_model_loaded() -> None:
             n=1,
             stop=stop_tokens,
         )
+        need_init = True
 
-        # --- 轻量级 warmup：触发一次 generate，提前完成 kernel / cache 初始化 ---
-        # 可通过 VLLM_DISABLE_WARMUP=1 关闭（例如在显存特别紧张的调试环境）。
+    # --- 大 Batch 预热（不在锁内执行异步逻辑） ---
+    if need_init and _engine is not None:
         disable_warmup = os.getenv("VLLM_DISABLE_WARMUP", "0").lower() in (
             "1",
             "true",
@@ -154,22 +237,7 @@ def ensure_model_loaded() -> None:
         )
         if not disable_warmup:
             try:
-                warmup_batch = min(4, BATCH_SIZE)
-                warmup_prompts = ["Warmup prompt"] * warmup_batch
-                warmup_max_tokens = min(8, MAX_NEW_TOKENS)
-                warmup_params = SamplingParams(
-                    max_tokens=warmup_max_tokens,
-                    temperature=0.0,
-                    top_p=1.0,
-                    n=1,
-                    stop=stop_tokens,
-                )
-                print(
-                    f"Warmup generate: batch={warmup_batch}, max_tokens={warmup_max_tokens}, "
-                    f"max_num_seqs={max_num_seqs}, gpu_mem_util={gpu_mem_util}"
-                )
-                _llm.generate(warmup_prompts, warmup_params)
-                print("Warmup generate: done.")
+                await _warmup_engine(_engine, _sampling_params.stop if _sampling_params else None, max_num_seqs, gpu_mem_util)
             except Exception as e:
                 # 预热失败不应影响正常推理；后续首个真实请求仍会完成初始化。
                 print(f"Warmup generate failed (ignored): {type(e).__name__}: {e}")
@@ -192,28 +260,42 @@ def build_prompt(question: str) -> str:
     return f"Q: {question}\nA:"
 
 
-def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
+async def _process_one(prompt: str, request_id: str) -> str:
+    """
+    使用 AsyncLLMEngine 处理单条 prompt，返回生成结果。
+    """
+    assert _engine is not None and _sampling_params is not None
+    final_output = None
+    gen = _engine.generate(prompt, _sampling_params, request_id)
+    async for request_output in gen:
+        final_output = request_output
+    if final_output is None or not final_output.outputs:
+        return ""
+    text = final_output.outputs[0].text or ""
+    return text.strip()
+
+
+async def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
     """
     对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py 的"token 级截去 prompt"逻辑：
     - tokenizer(prompts, padding=True, truncation=True, max_length=MAX_INPUT_LENGTH)
     - model.generate(max_new_tokens=MAX_NEW_TOKENS, do_sample=False, ...)
     - 对每条：按非 padding token 数计算 prompt_len，然后 outputs[i][prompt_len:] 解码为答案
+
+    这里基于 AsyncLLMEngine，通过 asyncio.gather 并行处理多条请求。
     """
-    ensure_model_loaded()
-    assert _llm is not None and _sampling_params is not None
+    await ensure_model_loaded()
+    assert _engine is not None and _sampling_params is not None
 
-    # vLLM 的 generate 接口本身就是批量化的，返回的 text 只包含“新生成 token”
-    outputs = _llm.generate(prompts, _sampling_params)
+    tasks = []
+    ts = time.time()
+    for idx, p in enumerate(prompts):
+        req_id = f"{ts}-{idx}-{uuid.uuid4()}"
+        tasks.append(_process_one(p, req_id))
 
-    answers: List[str] = []
-    for out in outputs:
-        if not out.outputs:
-            answers.append("")
-            continue
-        text = out.outputs[0].text or ""
-        answers.append(text.strip())
-
-    return answers
+    answers = await asyncio.gather(*tasks)
+    # 与原逻辑保持一致：去掉首尾空白
+    return [a.strip() for a in answers]
 
 
 # --- API 定义 ---
@@ -224,7 +306,7 @@ app = FastAPI(
 
 
 @app.on_event("startup")
-def _startup_warmup():
+async def _startup_warmup():
     """
     评测平台通常先做健康检查（GET /），再进入 predict 阶段。
     为了避免 predict 阶段首个请求才开始加载模型导致超时，这里在启动后后台预热加载（不阻塞服务启动）。
@@ -233,15 +315,12 @@ def _startup_warmup():
     if disable:
         return
 
-    def _bg():
         try:
-            ensure_model_loaded()
+        await ensure_model_loaded()
             print("Warmup: model loaded.")
         except Exception as e:
             # 不要让预热失败影响服务启动；真正推理时仍会触发 ensure_model_loaded 并抛出更明确错误
             print(f"Warmup failed (will retry on first /predict): {type(e).__name__}: {e}")
-
-    Thread(target=_bg, daemon=True).start()
 
 
 class PromptRequest(BaseModel):
@@ -253,7 +332,7 @@ class PredictResponse(BaseModel):
 
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(request: PromptRequest) -> PredictResponse:
+async def predict(request: PromptRequest) -> PredictResponse:
     """
     接收一个或多个 prompt，使用与微调脚本一致的格式进行推理，并返回结果。
 
@@ -261,31 +340,25 @@ def predict(request: PromptRequest) -> PredictResponse:
     - 普通模式：/ 返回 {"status": "ok"} 时，评测按单条调用，只使用 prompt 字段。
     - batch 模式：/ 返回 {"status": "batch"} 时，评测会一次性将所有问题通过 prompts 字段发到这里。
     """
-    ensure_model_loaded()
+    await ensure_model_loaded()
 
     # ---------- batch 模式：prompt 为 List[str] ----------
     if isinstance(request.prompt, list):
         batch_questions = request.prompt
-        responses: List[str] = []
-
-        # 分片多轮推理：<=BATCH_SIZE 一轮；否则切片多轮
-        for start in range(0, len(batch_questions), BATCH_SIZE):
-            chunk_questions = batch_questions[start : start + BATCH_SIZE]
-            chunk_prompts = [build_prompt(q) for q in chunk_questions]
-
-            chunk_answers = generate_answers_from_prompts(chunk_prompts)
+        prompts = [build_prompt(q) for q in batch_questions]
+        answers = await generate_answers_from_prompts(prompts)
             # 对齐 run_inference_eval.py：token 级切分后直接返回答案，不再做额外字符串截断
-            responses.extend([a.strip() for a in chunk_answers])
-        return PredictResponse(response=responses)
+        return PredictResponse(response=[a.strip() for a in answers])
 
     # ---------- 单条模式：fallback 到 prompt ----------
     prompt = build_prompt(request.prompt)
-    generated = generate_answers_from_prompts([prompt])[0]
+    generated_list = await generate_answers_from_prompts([prompt])
+    generated = generated_list[0] if generated_list else ""
     return PredictResponse(response=generated.strip())
 
 
 @app.get("/")
-def health_check():
+async def health_check():
     """
     健康检查端点：
     - 返回 {"status": "batch"} 时，评测系统会采用 batch 模式：
@@ -307,5 +380,5 @@ def health_check():
     )
     if not skip_model:
         # 阻塞直到模型加载 + 轻量 warmup 完成；若失败，抛出的异常会让健康检查返回 500。
-        ensure_model_loaded()
+        await ensure_model_loaded()
     return {"status": "batch"}

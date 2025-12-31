@@ -11,8 +11,8 @@ from modelscope import snapshot_download
 
 def main():
     # ModelScope 仓库名
-    # 4bit(bnb) 量化版本（你后续将上传到该 repo）
-    model_repo = "SLDRMK/Qwen3-4B-realistic-final"
+    # 4bit(AWQ) 量化版本（你后续将上传到该 repo）
+    model_repo = "SLDRMK/Qwen3-4B-realistic-awq4bit-final"
 
     # snapshot_download 会返回本地模型目录路径
     # 这里将 cache_dir 与 local_dir 显式指定为当前目录下的 Qwen3-4B 目录
@@ -21,9 +21,9 @@ def main():
     model_dir = snapshot_download(model_repo, cache_dir=".", local_dir="Qwen3-4B")
     print(f"模型已下载到本地目录：{model_dir}")
 
-    # --- 可选：为预量化(bnb4bit)模型补充量化配置（提升不同 transformers 版本的兼容性）---
-    # 你的量化导出目录包含 quantize_meta.json 且 safetensors 里大量权重为 U8，并带 quant_state.* 张量。
-    # 部分 transformers 版本在缺少 config.quantization_config 时会走“二次量化”路径导致报错。
+    # --- 可选：为 bitsandbytes 4bit 量化模型补充量化配置（提升不同 transformers 版本的兼容性）---
+    # 若 quantize_meta.json 中标记为 bitsandbytes，则为 config.json 写入 quantization_config；
+    # 对于 AWQ 等其他量化方式，不做修改，避免误写错误配置。
     try:
         import json
         import os
@@ -34,6 +34,10 @@ def main():
         if os.path.exists(qm_path) and os.path.exists(cfg_path):
             with open(qm_path, "r", encoding="utf-8") as f:
                 qm = json.load(f)
+            quant_method = str(qm.get("quant_method", "")).lower()
+            if quant_method != "bitsandbytes":
+                # 仅对 bitsandbytes 量化模型补充配置；AWQ 等其他类型跳过
+                return
             compute_dtype = str(qm.get("compute_dtype", "float16")).lower()
             qcfg = {
                 "quant_method": "bitsandbytes",

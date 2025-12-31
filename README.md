@@ -313,8 +313,8 @@ python eval_official_http.py \
 python eval_official_http.py \
   --no_start_server \
   --server_url http://127.0.0.1:8000 \
-  --repeat 3 \
-  --request_chunk_size 4 \
+  --repeat 1 \
+  --request_chunk_size 384 \
   --model_path ~/data/models/Qwen3-4B
 ```
 
