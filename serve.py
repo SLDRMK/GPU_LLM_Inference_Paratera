@@ -35,12 +35,13 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-4B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
-# 默认 384，与本地评测脚本和 README 中推荐参数保持一致（可通过环境变量 BATCH_SIZE 覆盖）。
+# 在当前 358 道题评测场景下，默认设置为 384（可通过环境变量 BATCH_SIZE 覆盖）。
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
-MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "1024"))
-# 每条最多生成多少新 token（对齐 run_inference_eval.py 默认）
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
+# 为提升 tokens/s，默认收紧到 512（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
+MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "512"))
+# 每条最多生成多少新 token；在医疗问答场景下默认 160（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "160"))
 # Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
 # - medical_qa: Q: ...\nA:
 # - chatml_lora: ChatML system/user/assistant
@@ -184,7 +185,8 @@ async def ensure_model_loaded() -> None:
 
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
-        default_max_len = MAX_INPUT_LENGTH + MAX_NEW_TOKENS + 512
+        #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 1024（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
+        default_max_len = 1024
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
 
         # --- 根据本地模型目录自动识别是否为 AWQ 量化模型，用于自动启用 AWQ 加速 ---
@@ -216,27 +218,12 @@ async def ensure_model_loaded() -> None:
             # AWQ 通常配合 float16 计算更稳定，这里自动切到 float16
             dtype = "float16"
 
-        # 针对不同显存容量的 GPU，自适应调节 vLLM 的并发与显存占用：
-        # - 这里将默认 gpu_memory_util 固定为 0.9（与 README / Docker 示例保持一致），
-        #   如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
+        # 针对当前 5090 32GB + 358 道题一次性 batch 评测场景：
+        # - max_num_seqs 只需覆盖单次请求的最大并发即可，无需再随着显存增大而放大；
+        # - 这里固定使用 max(BATCH_SIZE, 384) 作为默认值（可通过环境变量 VLLM_MAX_NUM_SEQS 覆盖）。
+        # - gpu_memory_utilization 仍默认 0.9，如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
         default_max_num_seqs = max(BATCH_SIZE, 384)
         default_gpu_mem_util = 0.9
-        try:
-            import torch  # type: ignore
-
-            if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
-                total_gb = props.total_memory / (1024**3)
-                # 22GB 做一个大致分界：包括 24GB 等中高端卡
-                if total_gb >= 22:
-                    # 24GB 级别：保持较高并发，显存利用率仍默认 0.9
-                    default_max_num_seqs = max(BATCH_SIZE, 512)
-                # 30GB+（如 32GB 5090）：可以进一步加大并发与显存占用来榨干吞吐
-                if total_gb >= 30:
-                    default_max_num_seqs = max(BATCH_SIZE, 768)
-        except Exception:
-            # torch 不可用或查询失败时退回到保守默认值
-            pass
 
         max_num_seqs = int(
             os.getenv("VLLM_MAX_NUM_SEQS", str(default_max_num_seqs))
