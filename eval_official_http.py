@@ -310,13 +310,13 @@ def main():
     p.add_argument(
         "--max_input_length",
         type=int,
-        default=int(os.getenv("MAX_INPUT_LENGTH", "1024")),
+        default=int(os.getenv("MAX_INPUT_LENGTH", "384")),
         help="prompt 侧最大长度，会通过 MAX_INPUT_LENGTH 传给 serve.py。",
     )
     p.add_argument(
         "--max_new_tokens",
         type=int,
-        default=int(os.getenv("MAX_NEW_TOKENS", "256")),
+        default=int(os.getenv("MAX_NEW_TOKENS", "128")),
         help="每条样本生成的新 token 上限，会通过 MAX_NEW_TOKENS 传给 serve.py。",
     )
     p.add_argument(
@@ -350,7 +350,7 @@ def main():
     p.add_argument(
         "--vllm_gpu_mem_util",
         type=float,
-        default=float(os.getenv("VLLM_GPU_MEM_UTIL", "0.9")),
+        default=float(os.getenv("VLLM_GPU_MEM_UTIL", "0.93")),
         help="vLLM 的 gpu_memory_utilization；0 表示使用 serve.py 的默认策略。",
     )
     p.add_argument(

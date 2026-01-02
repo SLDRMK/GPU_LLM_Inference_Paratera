@@ -201,13 +201,13 @@ sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67
   -e MAX_INPUT_LENGTH=1024 \
   -e MAX_NEW_TOKENS=200 \
   -e VLLM_MAX_NUM_SEQS=384 \
-  -e VLLM_GPU_MEM_UTIL=0.9 \
+  -e VLLM_GPU_MEM_UTIL=0.93 \
   -p 8000:8000 \
   paratera-demo:latest
 ```
 
 > 说明：
-> - 在 `serve.py` 中，`BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 的**代码默认值**已经分别设为 `384 / 384 / 0.9`，即使不传这些环境变量也会采用这一套高并行配置。
+> - 在 `serve.py` 中，`BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 的**代码默认值**已经分别设为 `384 / 384 / 0.93`，即使不传这些环境变量也会采用这一套高并行配置。
 > - 若在小显存 GPU 上运行，可通过环境变量下调这些值（例如 `BATCH_SIZE=64, VLLM_MAX_NUM_SEQS=64, VLLM_GPU_MEM_UTIL=0.6`）以避免 OOM。
 > - 如需关闭服务内部的轻量 warmup（首次加载时会做一次小 batch 的预热），可额外设置 `-e VLLM_DISABLE_WARMUP=1`。
 
@@ -230,14 +230,14 @@ sudo docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67
   -e MAX_INPUT_LENGTH=1024 \
   -e MAX_NEW_TOKENS=200 \
   -e VLLM_MAX_NUM_SEQS=384 \
-  -e VLLM_GPU_MEM_UTIL=0.9 \
+  -e VLLM_GPU_MEM_UTIL=0.93 \
   -p 8000:8000 \
   paratera-demo:latest
 ```
 
 > 说明：
 > - `PROMPT_STYLE` 默认就是 `chatml_lora`，这里显式写出便于确认与评测脚本一致。
-> - `BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 可根据显存和稳定性适当调整；如遇 OOM，可先减小 `BATCH_SIZE` 和 `VLLM_MAX_NUM_SEQS`。
+> - `BATCH_SIZE` / `VLLM_MAX_NUM_SEQS` / `VLLM_GPU_MEM_UTIL` 可根据显存和稳定性适当调整；如遇 OOM，可先减小 `BATCH_SIZE` 和 `VLLM_MAX_NUM_SEQS`，或把 `VLLM_GPU_MEM_UTIL` 从默认的 `0.93` 降低到 `0.8~0.9`。
 
 ### 5) 接口验证（符合评测契约）
 

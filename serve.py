@@ -38,10 +38,10 @@ LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-0.6B")
 # 在当前 358 道题评测场景下，默认设置为 384（可通过环境变量 BATCH_SIZE 覆盖）。
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
-# 为提升 tokens/s，默认收紧到 512（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
-MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "512"))
-# 每条最多生成多少新 token；在医疗问答场景下默认 160（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "160"))
+# 为进一步提升 tokens/s，在 0.6B 模型 + 358 道题场景下，默认收紧到 384（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
+MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "384"))
+# 每条最多生成多少新 token；在医疗问答场景下默认 128（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "128"))
 # Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
 # - medical_qa: Q: ...\nA:
 # - chatml_lora: ChatML system/user/assistant
@@ -185,8 +185,8 @@ async def ensure_model_loaded() -> None:
 
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
-        #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 1024（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
-        default_max_len = 1024
+        #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 896（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
+        default_max_len = 896
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
 
         # --- 根据本地模型目录自动识别是否为 AWQ 量化模型，用于自动启用 AWQ 加速 ---
@@ -221,9 +221,10 @@ async def ensure_model_loaded() -> None:
         # 针对当前 5090 32GB + 358 道题一次性 batch 评测场景：
         # - max_num_seqs 只需覆盖单次请求的最大并发即可，无需再随着显存增大而放大；
         # - 这里固定使用 max(BATCH_SIZE, 384) 作为默认值（可通过环境变量 VLLM_MAX_NUM_SEQS 覆盖）。
-        # - gpu_memory_utilization 仍默认 0.9，如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
+        # - gpu_memory_utilization 默认略微提高到 0.93，以更充分利用 32GB 显存；
+        #   如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
         default_max_num_seqs = max(BATCH_SIZE, 384)
-        default_gpu_mem_util = 0.9
+        default_gpu_mem_util = 0.93
 
         max_num_seqs = int(
             os.getenv("VLLM_MAX_NUM_SEQS", str(default_max_num_seqs))
