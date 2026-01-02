@@ -30,9 +30,9 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
 
 
 # 本地模型目录
-# 评测时容器内先运行 download_model.py，会在 /app 目录生成 /app/Qwen3-4B
+# 评测时容器内先运行 download_model.py，会在 /app 目录生成 /app/Qwen3-0.6B
 # 这里默认使用绝对路径，避免 vLLM 子进程 cwd 不同时把相对路径当成 HuggingFace repo id 解析。
-LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-4B")
+LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-0.6B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
 # 在当前 358 道题评测场景下，默认设置为 384（可通过环境变量 BATCH_SIZE 覆盖）。
@@ -342,7 +342,7 @@ async def generate_answers_from_prompts(prompts: List[str]) -> List[str]:
 # --- API 定义 ---
 app = FastAPI(
     title="Simple Inference Server",
-    description="A simple API to run a medical Qwen3-4B model.",
+    description="A simple API to run a medical Qwen3-0.6B AWQ model.",
 )
 
 

@@ -16,7 +16,7 @@
 
 您需要关注的核心文件是 `serve.py`。
 
-目前，它在 `serve.py` 中通过 `vllm` 加载本地模型目录 `/app/Qwen3-4B`（构建阶段由 `download_model.py` 下载）。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的 `/predict` 和 `/` 等端点即可。
+目前，它在 `serve.py` 中通过 `vllm` 加载本地模型目录 `/app/Qwen3-0.6B`（构建阶段由 `download_model.py` 下载）。您可以完全替换 `serve.py` 的内容，只要保证容器运行后，能提供模板中的 `/predict` 和 `/` 等端点即可。
 
 
 **重要**: 评测系统会向 `/predict` 端点发送 `POST` 请求，其JSON body格式为：
@@ -292,7 +292,7 @@ python -m pip install -i https://pypi.org/simple \
 cd paratera-demo
 mkdir -p ~/data/models
 cid=$(docker create paratera-demo:latest)
-docker cp "$cid":/app/Qwen3-4B ~/data/models/Qwen3-4B
+docker cp "$cid":/app/Qwen3-0.6B ~/data/models/Qwen3-0.6B"
 docker rm "$cid"
 ```
 
@@ -315,19 +315,19 @@ python eval_official_http.py \
   --server_url http://127.0.0.1:8000 \
   --repeat 1 \
   --request_chunk_size 384 \
-  --model_path ~/data/models/Qwen3-4B
+  --model_path ~/data/models/Qwen3-0.6B
 ```
 
 ### 6) 模型文件位置
 
-本模板在镜像构建阶段执行 `python download_model.py`，默认将模型下载到容器内工作目录下：
+本模板在镜像构建阶段执行 `python download_model.py`，默认将 0.6B AWQ 量化模型下载到容器内工作目录下：
 
-- 容器内路径：`/app/Qwen3-4B`
+- 容器内路径：`/app/Qwen3-0.6B`
 
 如需从镜像导出到宿主机：
 
 ```bash
 cid=$(docker create paratera-demo:latest)
-docker cp "$cid":/app/Qwen3-4B ./Qwen3-4B
+docker cp "$cid":/app/Qwen3-0.6B ./Qwen3-0.6B
 docker rm "$cid"
 ```

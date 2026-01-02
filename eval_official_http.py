@@ -288,7 +288,7 @@ def main():
         "--model_path",
         type=str,
         default=os.getenv(
-            "LOCAL_MODEL_PATH", os.path.expanduser("~/data/models/Qwen3-4B")
+            "LOCAL_MODEL_PATH", os.path.expanduser("~/data/models/Qwen3-0.6B")
         ),
         help="用于本地统计 tokens/s 的模型目录（需为宿主机可见的本地路径）。",
     )

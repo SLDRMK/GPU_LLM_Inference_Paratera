@@ -1,9 +1,9 @@
 """
 download_model.py（仅用于下载，下载完成后可删除）
 
-使用 ModelScope 从离线镜像仓库下载 Qwen3-4B 模型权重。
+使用 ModelScope 从离线镜像仓库下载 Qwen3-0.6B（AWQ 4bit）模型权重。
 该脚本应在有网络的环境下运行，下载完成后可将模型目录
-打包拷贝到评测机的 `/data/local/Qwen3-4B` 等路径下使用。
+打包拷贝到评测机的 `/data/local/Qwen3-0.6B` 等路径下使用。
 """
 
 from modelscope import snapshot_download
@@ -11,14 +11,14 @@ from modelscope import snapshot_download
 
 def main():
     # ModelScope 仓库名
-    # 4bit(AWQ) 量化版本（你后续将上传到该 repo）
-    model_repo = "SLDRMK/Qwen3-4B-realistic-awq4bit-final"
+    # 0.6B 4bit(AWQ) 量化版本
+    model_repo = "SLDRMK/Qwen3-0.6B-awq4bit"
 
     # snapshot_download 会返回本地模型目录路径
-    # 这里将 cache_dir 与 local_dir 显式指定为当前目录下的 Qwen3-4B 目录
-    # 这样评测时容器内运行脚本，会在当前工作目录生成 ./Qwen3-4B
-    print(f"开始通过 ModelScope 下载模型：{model_repo} 到当前目录 ./Qwen3-4B ...")
-    model_dir = snapshot_download(model_repo, cache_dir=".", local_dir="Qwen3-4B")
+    # 这里将 cache_dir 与 local_dir 显式指定为当前目录下的 Qwen3-0.6B 目录
+    # 这样评测时容器内运行脚本，会在当前工作目录生成 ./Qwen3-0.6B
+    print(f"开始通过 ModelScope 下载模型：{model_repo} 到当前目录 ./Qwen3-0.6B ...")
+    model_dir = snapshot_download(model_repo, cache_dir=".", local_dir="Qwen3-0.6B")
     print(f"模型已下载到本地目录：{model_dir}")
 
     # --- 可选：为 bitsandbytes 4bit 量化模型补充量化配置（提升不同 transformers 版本的兼容性）---
@@ -28,7 +28,7 @@ def main():
         import json
         import os
 
-        local_dir = "Qwen3-4B"
+        local_dir = "Qwen3-0.6B"
         qm_path = os.path.join(local_dir, "quantize_meta.json")
         cfg_path = os.path.join(local_dir, "config.json")
         if os.path.exists(qm_path) and os.path.exists(cfg_path):
