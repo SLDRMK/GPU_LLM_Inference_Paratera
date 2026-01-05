@@ -177,9 +177,9 @@ async def ensure_model_loaded() -> None:
         print(f"从本地加载模型（vLLM Async）：{LOCAL_MODEL_PATH}")
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
+        # 默认使用 bfloat16 / float16 计算精度（由环境变量控制），不再自动启用 AWQ 等权重量化；
+        # 若需要其他量化方式，可通过 VLLM_QUANTIZATION 显式配置。
         dtype = os.getenv("VLLM_DTYPE", "bfloat16")
-        # vLLM 量化方式（例如 "bitsandbytes" / "awq" / "gptq" 等）：
-        # - 默认不启用量化；如需开启，可通过环境变量 VLLM_QUANTIZATION 显式设置。
         quantization_env = os.getenv("VLLM_QUANTIZATION", "").strip().lower()
         quantization = quantization_env or None
 
@@ -188,35 +188,6 @@ async def ensure_model_loaded() -> None:
         #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 896（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
         default_max_len = 896
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
-
-        # --- 根据本地模型目录自动识别是否为 AWQ 量化模型，用于自动启用 AWQ 加速 ---
-        is_awq_model = False
-        try:
-            qm_path = os.path.join(LOCAL_MODEL_PATH, "quantize_meta.json")
-            cfg_path = os.path.join(LOCAL_MODEL_PATH, "config.json")
-            if os.path.exists(qm_path):
-                with open(qm_path, "r", encoding="utf-8") as f:
-                    qm = json.load(f)
-                q_method = str(qm.get("quant_method", "")).lower()
-                if "awq" in q_method:
-                    is_awq_model = True
-            if not is_awq_model and os.path.exists(cfg_path):
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                qcfg = cfg.get("quantization_config") or {}
-                q_method_conf = str(qcfg.get("quant_method", "")).lower()
-                if "awq" in q_method_conf:
-                    is_awq_model = True
-        except Exception as e:
-            # 量化方式检测失败不影响主流程，仅作为自动加速的提示信息
-            print(f"Detect AWQ quantization failed (ignored): {type(e).__name__}: {e}")
-
-        # 若检测到是 AWQ 模型，且用户未通过环境变量覆盖量化方式，则自动启用 AWQ + Marlin 加速
-        if is_awq_model and not quantization_env:
-            # vLLM 日志提示：可使用 awq_marlin 以获得更快推理
-            quantization = "awq_marlin"
-            # AWQ 通常配合 float16 计算更稳定，这里自动切到 float16
-            dtype = "float16"
 
         # 针对当前 5090 32GB + 358 道题一次性 batch 评测场景：
         # - max_num_seqs 只需覆盖单次请求的最大并发即可，无需再随着显存增大而放大；
@@ -233,12 +204,16 @@ async def ensure_model_loaded() -> None:
             os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
         )
 
+        # KV cache 默认统一使用 fp8，以减少显存占用、提升吞吐；如需关闭，可通过环境变量
+        # VLLM_KV_CACHE_DTYPE 覆盖为 "auto" / "fp16" 等。
+        kv_cache_dtype = os.getenv("VLLM_KV_CACHE_DTYPE", "fp8").strip() or None
+
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
             trust_remote_code=True,
             tensor_parallel_size=tp_size,
-            dtype=dtype,  # "bfloat16" 在 RTX5090 上更友好
+            dtype=dtype,  # "bfloat16"/"float16" 在 RTX5090 上更友好
             max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
             gpu_memory_utilization=gpu_mem_util,
@@ -248,9 +223,9 @@ async def ensure_model_loaded() -> None:
         # - 例如：VLLM_QUANTIZATION=bitsandbytes / awq / gptq
         if quantization is not None:
             engine_kwargs["quantization"] = quantization
-        # AWQ 模型额外开启 fp8 KV cache，以进一步压缩显存、提升吞吐（需 vLLM 版本支持）
-        if is_awq_model:
-            engine_kwargs["kv_cache_dtype"] = "fp8"
+        # 统一使用（或显式配置）KV cache 精度
+        if kv_cache_dtype is not None:
+            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
 
         engine_args = AsyncEngineArgs(**engine_kwargs)
         _engine = AsyncLLMEngine.from_engine_args(engine_args)

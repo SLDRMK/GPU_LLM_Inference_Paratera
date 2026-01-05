@@ -1,7 +1,7 @@
 """
 download_model.py（仅用于下载，下载完成后可删除）
 
-使用 ModelScope 从离线镜像仓库下载 Qwen3-0.6B（AWQ 4bit）模型权重。
+使用 ModelScope 从离线镜像仓库下载 Qwen3-0.6B（未量化基座）模型权重。
 该脚本应在有网络的环境下运行，下载完成后可将模型目录
 打包拷贝到评测机的 `/data/local/Qwen3-0.6B` 等路径下使用。
 """
@@ -11,8 +11,8 @@ from modelscope import snapshot_download
 
 def main():
     # ModelScope 仓库名
-    # 0.6B 4bit(AWQ) 量化版本
-    model_repo = "SLDRMK/Qwen3-0.6B-awq4bit"
+    # 0.6B 基座模型（不使用 AWQ 量化）
+    model_repo = "SLDRMK/Qwen3-0.6B"
 
     # snapshot_download 会返回本地模型目录路径
     # 这里将 cache_dir 与 local_dir 显式指定为当前目录下的 Qwen3-0.6B 目录
