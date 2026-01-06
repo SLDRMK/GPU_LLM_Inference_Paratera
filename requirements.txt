@@ -1,11 +1,6 @@
-fastapi==0.127.0
+fastapi>=0.104.0
 uvicorn>=0.24.0
-# 与基础镜像内 vllm==0.11.0 / openai-harmony 对齐，避免被 requirements 强制降级：
-# 基础镜像中已有 pydantic>=2.11.7，这里只要求下限，不再固定为 2.11.2。
-pydantic>=2.11.7
-transformers==4.57.3
-tokenizers==0.22.1
+# 不固定 vLLM 依赖栈中的版本，只给出较宽松下限，避免与 vllm-openai:v0.13.0 内置依赖冲突。
+pydantic>=2.4.0
+# 仅额外引入 ModelScope，用于 download_model.py 下载本地模型。
 modelscope>=1.18.0
-tiktoken>=0.7.0
-accelerate>=0.33.0
-bitsandbytes>=0.43.3
