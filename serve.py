@@ -10,7 +10,6 @@ from typing import List, Union
 from fastapi import FastAPI
 from pydantic import BaseModel
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
-from vllm.config import AttentionConfig
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -51,7 +50,7 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 # - chatml_lora: ChatML system/user/assistant
 PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 
-# --- 与 work2 对齐的编译 / 注意力配置 ---
+# --- 与 work2 对齐的编译配置（不使用 AttentionConfig，兼容当前 vLLM 版本） ---
 # 针对 358 道题评测场景的自定义 CUDA Graph 捕获尺寸
 CUSTOM_CAPTURE_SIZES = [
     1,
@@ -85,14 +84,6 @@ COMPILATION_CONFIG = {
     "use_inductor_graph_partition": True,
     "cudagraph_specialize_lora": True,
 }
-
-ATTN_CONFIG = AttentionConfig(
-    backend="FLASHINFER",
-    use_trtllm_attention=True,
-    use_prefill_decode_attention=True,
-    use_cudnn_prefill=True,
-    flash_attn_max_num_splits_for_cuda_graph=16,
-)
 
 _load_lock = Lock()
 _engine: AsyncLLMEngine | None = None
@@ -225,7 +216,7 @@ async def ensure_model_loaded() -> None:
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
 
-        # --- 完全对齐 work2 的 AsyncEngineArgs 配置 ---
+        # --- 尽量对齐 work2 的 AsyncEngineArgs 配置（去掉当前 vLLM 不支持的 attention_config 参数） ---
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
@@ -254,7 +245,6 @@ async def ensure_model_loaded() -> None:
             enable_chunked_prefill=False,
             enable_prefix_caching=True,
             compilation_config=COMPILATION_CONFIG,
-            attention_config=ATTN_CONFIG,
         )
 
         engine_args = AsyncEngineArgs(**engine_kwargs)
