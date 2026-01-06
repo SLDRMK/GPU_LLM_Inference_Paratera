@@ -126,4 +126,4 @@ python eval_official_http.py \
 感谢 vLLM 开源社区提供的卓越推理框架支持。
 感谢 ModelScope 社区提供的模型托管服务。
 感谢 Qwen 团队开源的优秀模型。
-感谢VincentYang, 名井南等同学的技术交流与支持。
+感谢VincentYang(哈基米磨南北绿豆), 名井南等同学的技术交流与支持。
