@@ -10,6 +10,7 @@ from typing import List, Union
 from fastapi import FastAPI
 from pydantic import BaseModel
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm.config import AttentionConfig
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -84,6 +85,14 @@ COMPILATION_CONFIG = {
     "use_inductor_graph_partition": True,
     "cudagraph_specialize_lora": True,
 }
+
+ATTN_CONFIG = AttentionConfig(
+    backend="FLASHINFER",
+    use_trtllm_attention=True,
+    use_prefill_decode_attention=True,
+    use_cudnn_prefill=True,
+    flash_attn_max_num_splits_for_cuda_graph=16,
+)
 
 _load_lock = Lock()
 _engine: AsyncLLMEngine | None = None
@@ -216,7 +225,7 @@ async def ensure_model_loaded() -> None:
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
 
-        # --- 尽量对齐 work2 的 AsyncEngineArgs 配置（去掉当前 vLLM 不支持的 attention_config 参数） ---
+        # --- 对齐 work2 的 AsyncEngineArgs 配置（基于 vLLM v0.13.0） ---
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
@@ -245,6 +254,7 @@ async def ensure_model_loaded() -> None:
             enable_chunked_prefill=False,
             enable_prefix_caching=True,
             compilation_config=COMPILATION_CONFIG,
+            attention_config=ATTN_CONFIG,
         )
 
         engine_args = AsyncEngineArgs(**engine_kwargs)

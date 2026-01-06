@@ -1,7 +1,6 @@
-## 基础镜像：使用评测平台提供的 vLLM OpenAI 镜像（华为云镜像加速）
-## 对应 README 中的 swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.11.0
+## 基础镜像：使用 vLLM OpenAI v0.13.0
 ## 注意：请勿修改 EXPOSE 端口和 CMD 命令
-FROM swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.11.0
+FROM m.daocloud.io/docker.io/vllm/vllm-openai:v0.13.0
 
 # 可选构建参数：
 # - SKIP_SETUP=1 时跳过 pip 安装和模型下载（本地反复调试时提速）
