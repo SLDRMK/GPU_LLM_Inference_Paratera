@@ -10,6 +10,7 @@ from typing import List, Union
 from fastapi import FastAPI
 from pydantic import BaseModel
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+from vllm.config import AttentionConfig
 
 # 与训练脚本保持一致：强制离线模式，避免任何联网请求
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -29,23 +30,69 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
         return False
 
 
+# 强制使用 Triton Attention 后端（与 work2 配置保持一致）
+os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+
 # 本地模型目录
 # 评测时容器内先运行 download_model.py，会在 /app 目录生成 /app/Qwen3-0.6B
 # 这里默认使用绝对路径，避免 vLLM 子进程 cwd 不同时把相对路径当成 HuggingFace repo id 解析。
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-0.6B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
-# 在当前 358 道题评测场景下，默认设置为 384（可通过环境变量 BATCH_SIZE 覆盖）。
+# 与 work2 配置保持一致：默认 384（可通过环境变量 BATCH_SIZE 覆盖）。
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
-# 为进一步提升 tokens/s，在 0.6B 模型 + 358 道题场景下，默认收紧到 384（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
-MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "384"))
-# 每条最多生成多少新 token；在医疗问答场景下默认 128（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "128"))
+# 与 work2 中 max_model_len=256 对齐，这里默认收紧到 256（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
+MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "256"))
+# 每条最多生成多少新 token；与 work2 中采样参数 max_tokens=256 对齐（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 # Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
 # - medical_qa: Q: ...\nA:
 # - chatml_lora: ChatML system/user/assistant
 PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
+
+# --- 与 work2 对齐的编译 / 注意力配置 ---
+# 针对 358 道题评测场景的自定义 CUDA Graph 捕获尺寸
+CUSTOM_CAPTURE_SIZES = [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    358,  # 为 batch=358 专门录制无 padding 的图
+    384,
+    512,
+]
+
+COMPILATION_CONFIG = {
+    "mode": 3,  # 激进编译优化
+    "cudagraph_mode": "FULL",
+    "splitting_ops": [],
+    "backend": "inductor",
+    "cudagraph_capture_sizes": CUSTOM_CAPTURE_SIZES,
+    "max_cudagraph_capture_size": 512,
+    "compile_sizes": [358],
+    "inductor_compile_config": {
+        "combo_kernels": True,
+        "benchmark_combo_kernel": True,
+        "epilogue_fusion": True,
+        "max_autotune": True,
+    },
+    "use_inductor_graph_partition": True,
+    "cudagraph_specialize_lora": True,
+}
+
+ATTN_CONFIG = AttentionConfig(
+    backend="FLASHINFER",
+    use_trtllm_attention=True,
+    use_prefill_decode_attention=True,
+    use_cudnn_prefill=True,
+    flash_attn_max_num_splits_for_cuda_graph=16,
+)
 
 _load_lock = Lock()
 _engine: AsyncLLMEngine | None = None
@@ -177,49 +224,38 @@ async def ensure_model_loaded() -> None:
         print(f"从本地加载模型（vLLM Async）：{LOCAL_MODEL_PATH}")
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
-        # 默认使用 bfloat16 计算精度；不再自动启用 AWQ 等权重量化；
-        dtype = os.getenv("VLLM_DTYPE", "bfloat16")
-        
-        # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
-        # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
-        #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 896（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
-        default_max_len = 896
-        max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
 
-        # 针对当前 5090 32GB + 358 道题一次性 batch 评测场景：
-        # - max_num_seqs 只需覆盖单次请求的最大并发即可
-        default_max_num_seqs = max(BATCH_SIZE, 384)
-        default_gpu_mem_util = 0.93
-
-        max_num_seqs = int(
-            os.getenv("VLLM_MAX_NUM_SEQS", str(default_max_num_seqs))
-        )
-        gpu_mem_util = float(
-            os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
-        )
-
+        # --- 完全对齐 work2 的 AsyncEngineArgs 配置 ---
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
             trust_remote_code=True,
             tensor_parallel_size=tp_size,
-            dtype=dtype,
-            max_model_len=max_model_len,
-            max_num_seqs=max_num_seqs,
-            gpu_memory_utilization=gpu_mem_util,
-            enable_prefix_caching=True,
-            # 官方推荐生产环境编译优化等级 level=3（自动启用算子融合等 pass）
-            compilation_config={"level": 3},
-            # 显式使用 CUDA Graph（默认就是 False 即启用，但这里明确写出）
+            # 1) 量化与加速内核
+            quantization="fp8",
+            dtype="float16",
+            disable_cascade_attn=True,
+            mm_processor_cache_gb=0,
+            # 2) 显存与上下文
+            gpu_memory_utilization=0.90,
+            max_model_len=256,
+            # 3) Blackwell/5090 优化
+            kv_cache_dtype="fp8_e4m3",
+            optimization_level=3,
+            # 4) 调度与 CUDA Graph
+            async_scheduling=True,
+            stream_interval=16,
+            max_num_seqs=384,
+            max_num_batched_tokens=98304,
+            swap_space=0,
+            disable_sliding_window=True,
             enforce_eager=False,
-            # 保持 FP8 KV Cache
-            kv_cache_dtype="fp8",
+            disable_log_stats=True,
+            enable_chunked_prefill=False,
+            enable_prefix_caching=True,
+            compilation_config=COMPILATION_CONFIG,
+            attention_config=ATTN_CONFIG,
         )
-
-        # 仅当显式设置了 VLLM_QUANTIZATION 时，才把 quantization 传给 vLLM
-        quantization_env = os.getenv("VLLM_QUANTIZATION", "").strip().lower()
-        if quantization_env:
-            engine_kwargs["quantization"] = quantization_env
 
         engine_args = AsyncEngineArgs(**engine_kwargs)
         _engine = AsyncLLMEngine.from_engine_args(engine_args)
