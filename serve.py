@@ -30,7 +30,7 @@ def check_internet(host: str = "8.8.8.8", port: int = 53, timeout: int = 3) -> b
         return False
 
 
-# 强制使用 Triton Attention 后端（与 work2 配置保持一致）
+# 强制使用 Triton Attention 后端
 os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 
 # 本地模型目录
@@ -39,19 +39,19 @@ os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 LOCAL_MODEL_PATH = os.getenv("LOCAL_MODEL_PATH", "/app/Qwen3-0.6B")
 
 # 评测 batch 模式的全局 batch_size（一次推理的最大条数，超出则分多轮推理）
-# 与 work2 配置保持一致：默认 384（可通过环境变量 BATCH_SIZE 覆盖）。
+# 默认 384（可通过环境变量 BATCH_SIZE 覆盖）。
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "384"))
 # 输入侧最大长度（只截断 prompt；生成长度用 max_new_tokens 控制）
-# 与 work2 中 max_model_len=256 对齐，这里默认收紧到 256（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
+# 默认收紧到 256（可通过环境变量 MAX_INPUT_LENGTH 覆盖）。
 MAX_INPUT_LENGTH = int(os.getenv("MAX_INPUT_LENGTH", "256"))
-# 每条最多生成多少新 token；与 work2 中采样参数 max_tokens=256 对齐（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
+# 每条最多生成多少新 token；采样参数 max_tokens=256 对齐（可通过环境变量 MAX_NEW_TOKENS 覆盖）。
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
 # Prompt 风格：对齐 /home/sldrmk/WorkSpace/GPU_LLM/run_inference_eval.py
 # - medical_qa: Q: ...\nA:
 # - chatml_lora: ChatML system/user/assistant
 PROMPT_STYLE = os.getenv("PROMPT_STYLE", "chatml_lora").strip().lower()
 
-# --- 与 work2 对齐的编译配置（不使用 AttentionConfig，兼容当前 vLLM 版本） ---
+# --- 编译配置（兼容 vLLM v0.13.0） ---
 # 针对 358 道题评测场景的自定义 CUDA Graph 捕获尺寸
 CUSTOM_CAPTURE_SIZES = [
     1,
@@ -225,7 +225,7 @@ async def ensure_model_loaded() -> None:
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
 
-        # --- 对齐 work2 的 AsyncEngineArgs 配置（基于 vLLM v0.13.0） ---
+        # --- AsyncEngineArgs 配置（基于 vLLM v0.13.0） ---
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
