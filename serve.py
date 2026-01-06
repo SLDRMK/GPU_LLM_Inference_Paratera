@@ -177,12 +177,9 @@ async def ensure_model_loaded() -> None:
         print(f"从本地加载模型（vLLM Async）：{LOCAL_MODEL_PATH}")
 
         tp_size = int(os.getenv("VLLM_TP_SIZE", "1"))
-        # 默认使用 bfloat16 / float16 计算精度（由环境变量控制），不再自动启用 AWQ 等权重量化；
-        # 若需要其他量化方式，可通过 VLLM_QUANTIZATION 显式配置。
+        # 默认使用 bfloat16 计算精度；不再自动启用 AWQ 等权重量化；
         dtype = os.getenv("VLLM_DTYPE", "bfloat16")
-        quantization_env = os.getenv("VLLM_QUANTIZATION", "").strip().lower()
-        quantization = quantization_env or None
-
+        
         # 为了在本地 16GB 级别显卡上也能稳定运行，显式收紧部分 vLLM 资源配置：
         # - max_model_len：默认从模型 config 读取（40960），这里根据实际需求缩小上下文上限，显著减少 KV cache 占用。
         #   在当前 5090 32GB + 358 道题评测场景下，默认固定为 896（可通过环境变量 VLLM_MAX_MODEL_LEN 覆盖）。
@@ -190,10 +187,7 @@ async def ensure_model_loaded() -> None:
         max_model_len = int(os.getenv("VLLM_MAX_MODEL_LEN", str(default_max_len)))
 
         # 针对当前 5090 32GB + 358 道题一次性 batch 评测场景：
-        # - max_num_seqs 只需覆盖单次请求的最大并发即可，无需再随着显存增大而放大；
-        # - 这里固定使用 max(BATCH_SIZE, 384) 作为默认值（可通过环境变量 VLLM_MAX_NUM_SEQS 覆盖）。
-        # - gpu_memory_utilization 默认略微提高到 0.93，以更充分利用 32GB 显存；
-        #   如需更激进或更保守，可通过环境变量 VLLM_GPU_MEM_UTIL 显式覆盖。
+        # - max_num_seqs 只需覆盖单次请求的最大并发即可
         default_max_num_seqs = max(BATCH_SIZE, 384)
         default_gpu_mem_util = 0.93
 
@@ -204,28 +198,28 @@ async def ensure_model_loaded() -> None:
             os.getenv("VLLM_GPU_MEM_UTIL", str(default_gpu_mem_util))
         )
 
-        # KV cache 默认统一使用 fp8，以减少显存占用、提升吞吐；如需关闭，可通过环境变量
-        # VLLM_KV_CACHE_DTYPE 覆盖为 "auto" / "fp16" 等。
-        kv_cache_dtype = os.getenv("VLLM_KV_CACHE_DTYPE", "fp8").strip() or None
-
         engine_kwargs = dict(
             model=LOCAL_MODEL_PATH,
             tokenizer=LOCAL_MODEL_PATH,
             trust_remote_code=True,
             tensor_parallel_size=tp_size,
-            dtype=dtype,  # "bfloat16"/"float16" 在 RTX5090 上更友好
+            dtype=dtype,
             max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
             gpu_memory_utilization=gpu_mem_util,
             enable_prefix_caching=True,
+            # 官方推荐生产环境编译优化等级 level=3（自动启用算子融合等 pass）
+            compilation_config={"level": 3},
+            # 显式使用 CUDA Graph（默认就是 False 即启用，但这里明确写出）
+            enforce_eager=False,
+            # 保持 FP8 KV Cache
+            kv_cache_dtype="fp8",
         )
-        # 仅当显式设置了 VLLM_QUANTIZATION 时，才把 quantization 传给 vLLM：
-        # - 例如：VLLM_QUANTIZATION=bitsandbytes / awq / gptq
-        if quantization is not None:
-            engine_kwargs["quantization"] = quantization
-        # 统一使用（或显式配置）KV cache 精度
-        if kv_cache_dtype is not None:
-            engine_kwargs["kv_cache_dtype"] = kv_cache_dtype
+
+        # 仅当显式设置了 VLLM_QUANTIZATION 时，才把 quantization 传给 vLLM
+        quantization_env = os.getenv("VLLM_QUANTIZATION", "").strip().lower()
+        if quantization_env:
+            engine_kwargs["quantization"] = quantization_env
 
         engine_args = AsyncEngineArgs(**engine_kwargs)
         _engine = AsyncLLMEngine.from_engine_args(engine_args)
