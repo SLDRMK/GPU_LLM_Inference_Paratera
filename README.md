@@ -1,13 +1,18 @@
 # Paratera Demo (UCAS-GPU-LLM-Inference)
 
+By SLDRMK
+
 ## 1. 项目简介 (Introduction)
 
-本项目是中国科学院大学《GPU架构与编程》课程大作业二（LLM Inference Optimization）的推理服务部分。
+本项目是中国科学院大学2025秋《GPU架构与编程》课程大作业二（LLM Inference Optimization）的推理服务部分。
 
-本方案针对 **Qwen/Qwen3-0.6B** 模型在 NVIDIA RTX 5090 (32GB) 环境下的高吞吐推理进行了深度优化。在开发过程中，我们经历了从 **Qwen3-4B AWQ** 量化模型到 **Qwen3-0.6B 浮点基座 + FP8 KV Cache** 的技术路线切换：
+本方案针对 **Qwen/Qwen3-0.6B** 模型在 NVIDIA RTX 5090 (32GB) 环境下的高吞吐推理进行了深度优化。在开发过程中，经历了从 **Qwen3-4B AWQ** 量化模型到 **Qwen3-0.6B 浮点基座 + FP8 KV Cache** 的技术路线切换：
 
-- **初期尝试**：使用 Qwen3-4B-AWQ 模型，利用 vLLM 的 AWQ Marlin 内核进行加速。虽然显存占用得到控制，但在极高并发下（batch size > 256）算力仍是瓶颈，tokens/s 提升受限。
-- **最终方案**：切换至参数量更小但架构更优秀的 **Qwen3-0.6B** 基座模型，配合 **FP8 KV Cache** 与 **激进的算子融合编译（torch.compile + Inductor）**。这一转变使得在保持高精度的同时，推理吞吐量（tokens/s）获得了数倍提升，充分释放了 5090 的算力与显存带宽。
+- **初期尝试**：使用 Qwen3-4B-AWQ 模型，利用 vLLM 的 AWQ Marlin 内核进行加速。虽然显存占用得到控制，但在极高并发下（batch size > 256）算力仍是瓶颈，tokens/s 提升受限。最终最好成绩约**16k tokens/s**。
+- **最终方案**：切换至参数量更小但架构更优秀的 **Qwen3-0.6B** 基座模型，配合 **FP8 KV Cache** 与 **激进的算子融合编译（torch.compile + Inductor）**。这一转变使得在保持高精度的同时，推理吞吐量（tokens/s）获得了数倍提升，充分释放了 5090 的算力与显存带宽。最终最好成绩约**42k tokens/s**。
+- 最终排名情况见下图
+
+![](./pics/rank.jpeg)
 
 **注意**：本项目仅包含推理服务与评测逻辑；模型的微调训练部分请参考：[SLDRMK/GPU_LLM](https://github.com/SLDRMK/GPU_LLM)。
 
@@ -28,7 +33,7 @@
 
 ## 3. 项目特点 (Features)
 
-本项目基于 vLLM 引擎进行了深度的参数调优与编译优化，主要特点包括：
+本项目基于 vLLM 引擎进行了深度的参数调优与编译优化，核心服务代码位于[serve.py](./serve.py)中，主要特点包括：
 
 1.  **极致的编译优化 (Aggressive Compilation)**：
     -   启用 `torch.compile` (Inductor backend) 的最高优化等级 (Level 3)。
@@ -50,6 +55,10 @@
 5.  **精简的依赖管理**：
     -   Docker 镜像基于 `vllm-openai:v0.13.0`，严格对齐生产环境版本。
     -   `requirements.txt` 采用兼容性配置，避免破坏基础镜像构建好的 CUDA/PyTorch 依赖栈。
+
+6.  **仿真评测系统**
+    -   使用`http`服务进行健康检查和问答服务
+    -   [eval_official_http.py](./eval_official_http.py)模拟评测系统批量推送提问，进行`RougeL score`计算和推理速度（`tokens/s`）等，方便进行调试。
 
 ---
 
