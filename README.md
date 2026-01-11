@@ -6,6 +6,8 @@ By SLDRMK
 
 本项目是中国科学院大学2025秋《GPU架构与编程》课程大作业二（LLM Inference Optimization）的推理服务部分。
 
+项目地址：[https://github.com/SLDRMK/GPU_LLM_Inference_Paratera](https://github.com/SLDRMK/GPU_LLM_Inference_Paratera)
+
 本方案针对 **Qwen/Qwen3-0.6B** 模型在 NVIDIA RTX 5090 (32GB) 环境下的高吞吐推理进行了深度优化。在开发过程中，经历了从 **Qwen3-4B AWQ** 量化模型到 **Qwen3-0.6B 浮点基座 + FP8 KV Cache** 的技术路线切换：
 
 - **初期尝试**：使用 Qwen3-4B-AWQ 模型，利用 vLLM 的 AWQ Marlin 内核进行加速。虽然显存占用得到控制，但在极高并发下（batch size > 256）算力仍是瓶颈，tokens/s 提升受限。最终最好成绩约**16k tokens/s**。
@@ -132,7 +134,11 @@ python eval_official_http.py \
 ## 5. 致谢 (Acknowledgments)
 
 感谢中国科学院大学《GPU架构与编程》赵地老师课程组提供的平台与指导。
+
 感谢 vLLM 开源社区提供的卓越推理框架支持。
+
 感谢 ModelScope 社区提供的模型托管服务。
+
 感谢 Qwen 团队开源的优秀模型。
+
 感谢VincentYang(哈基米磨南北绿豆), 名井南等同学的技术交流与支持。
